@@ -12,7 +12,6 @@ Usage:
     python app.py
 """
 
-import os
 import tempfile
 import cv2
 import numpy as np
@@ -47,7 +46,6 @@ def _bgr_to_rgb(img: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def load_video(video_file):
-    """Load video and return metadata + preview frame."""
     global _processor
     if video_file is None:
         return None, "No video loaded.", 0, 0, 0, 0
@@ -65,25 +63,17 @@ def load_video(video_file):
         f"- Duration: {_processor.duration:.2f}s\n"
         f"- Total frames: {_processor.total_frames}"
     )
-
-    return (
-        preview,
-        info,
-        0,
-        round(_processor.duration, 2),
-        min(2.0, _processor.duration),
-        round(_processor.duration, 2),
-    )
+    return (preview, info, 0, round(_processor.duration, 2),
+            min(2.0, _processor.duration), round(_processor.duration, 2))
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Select section & extract frames
+# Step 2 — Extract section
 # ---------------------------------------------------------------------------
 
 def extract_section(start_time, end_time):
-    """Extract frames from the selected time range and show thumbnails."""
     global _all_section_frames, _panoramic_pipeline
-    _panoramic_pipeline = None  # reset on new section
+    _panoramic_pipeline = None
 
     if _processor is None:
         return None, "Load a video first."
@@ -96,22 +86,20 @@ def extract_section(start_time, end_time):
 
     step = max(1, len(_all_section_frames) // 20)
     thumbs = _all_section_frames[::step][:20]
-    gallery_images = []
+    gallery = []
     for idx, frame in thumbs:
-        rgb = _bgr_to_rgb(frame)
         t = idx / _processor.fps
-        gallery_images.append((rgb, f"Frame {idx} ({t:.2f}s)"))
+        gallery.append((_bgr_to_rgb(frame), f"Frame {idx} ({t:.2f}s)"))
 
     info = f"Extracted **{len(_all_section_frames)}** frames ({start_time:.2f}s – {end_time:.2f}s)"
-    return gallery_images, info
+    return gallery, info
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Align & build panorama (moving camera)
+# Step 3 — Align & stitch panorama
 # ---------------------------------------------------------------------------
 
-def align_and_stitch(bg_method):
-    """For moving camera: align all section frames and build panoramic background."""
+def align_and_stitch(bg_method, backdrop_density):
     global _panoramic_pipeline
     if not _all_section_frames:
         return None, "Extract a video section first."
@@ -119,7 +107,8 @@ def align_and_stitch(bg_method):
     frames_bgr = [f for _, f in _all_section_frames]
     _panoramic_pipeline = PanoramicPipeline(frames_bgr)
     _panoramic_pipeline.align_frames()
-    _panoramic_pipeline.build_panorama(method=bg_method)
+    _panoramic_pipeline.build_panorama(method=bg_method,
+                                       backdrop_density=int(backdrop_density))
 
     pano = _panoramic_pipeline.get_panorama_preview()
     if pano is None:
@@ -129,9 +118,10 @@ def align_and_stitch(bg_method):
     info = (
         f"**Panorama built**\n"
         f"- Canvas size: {_panoramic_pipeline.canvas_w} x {_panoramic_pipeline.canvas_h}\n"
-        f"- Frames aligned: {len(frames_bgr)}\n"
+        f"- Frames used for backdrop: **{min(int(backdrop_density), len(frames_bgr))}** "
+        f"of {len(frames_bgr)} total\n"
         f"- Background expanded from {_processor.width}x{_processor.height} "
-        f"to {_panoramic_pipeline.canvas_w}x{_panoramic_pipeline.canvas_h}"
+        f"→ {_panoramic_pipeline.canvas_w}x{_panoramic_pipeline.canvas_h}"
     )
     return pano_rgb, info
 
@@ -141,7 +131,6 @@ def align_and_stitch(bg_method):
 # ---------------------------------------------------------------------------
 
 def pick_keyframes_auto(num_keyframes, sensitivity, camera_mode):
-    """Automatically select keyframes based on subject movement."""
     if _processor is None or not _all_section_frames:
         return None, "Extract a video section first."
 
@@ -152,8 +141,7 @@ def pick_keyframes_auto(num_keyframes, sensitivity, camera_mode):
             _all_section_frames, pipe.panorama,
             pipe.cumulative_H, pipe.offset_H,
             pipe.canvas_w, pipe.canvas_h,
-            num_keyframes=int(num_keyframes),
-            threshold=threshold,
+            num_keyframes=int(num_keyframes), threshold=threshold,
         )
     else:
         frames_bgr = [f for _, f in _all_section_frames]
@@ -161,8 +149,7 @@ def pick_keyframes_auto(num_keyframes, sensitivity, camera_mode):
         threshold = max(10, 60 - int(sensitivity))
         selected_indices = auto_select_keyframes(
             _all_section_frames, background,
-            num_keyframes=int(num_keyframes),
-            threshold=threshold,
+            num_keyframes=int(num_keyframes), threshold=threshold,
         )
 
     gallery = []
@@ -178,7 +165,6 @@ def pick_keyframes_auto(num_keyframes, sensitivity, camera_mode):
 
 
 def pick_keyframes_uniform(num_keyframes):
-    """Select keyframes at uniform intervals."""
     if not _all_section_frames:
         return None, "Extract a video section first."
 
@@ -204,44 +190,38 @@ def pick_keyframes_uniform(num_keyframes):
 # ---------------------------------------------------------------------------
 
 def generate_composite(
-    num_keyframes,
-    selection_mode,
-    sensitivity,
-    camera_mode,
-    bg_method,
-    seg_threshold,
-    morph_size,
-    opacity,
-    enable_shadow,
+    num_keyframes, selection_mode, sensitivity, camera_mode,
+    bg_method, backdrop_density,
+    seg_threshold, morph_size, dilate_iter, erode_iter, feather_radius,
+    min_object_pct, opacity, enable_shadow,
 ):
-    """Generate the final stop-motion composite image."""
     if _processor is None or not _all_section_frames:
         return None, "Extract a video section first."
 
     frames_bgr = [f for _, f in _all_section_frames]
+    min_area = float(min_object_pct) / 100.0
 
     # ── Moving camera path ────────────────────────────────────────────
     if camera_mode == "Moving Camera":
         global _panoramic_pipeline
-        # Build pipeline if not already done
         if _panoramic_pipeline is None:
             _panoramic_pipeline = PanoramicPipeline(frames_bgr)
             _panoramic_pipeline.align_frames()
-            _panoramic_pipeline.build_panorama(method=bg_method)
+            _panoramic_pipeline.build_panorama(
+                method=bg_method,
+                backdrop_density=int(backdrop_density),
+            )
 
         pipe = _panoramic_pipeline
 
-        # Select keyframe list-indices (positions within section frames)
         if selection_mode == "Auto (movement-based)":
             thresh_auto = max(10, 60 - int(sensitivity))
             selected_frame_ids = auto_select_keyframes_moving(
                 _all_section_frames, pipe.panorama,
                 pipe.cumulative_H, pipe.offset_H,
                 pipe.canvas_w, pipe.canvas_h,
-                num_keyframes=int(num_keyframes),
-                threshold=thresh_auto,
+                num_keyframes=int(num_keyframes), threshold=thresh_auto,
             )
-            # Convert frame IDs to list indices
             id_to_li = {fid: li for li, (fid, _) in enumerate(_all_section_frames)}
             kf_list_indices = [id_to_li[fid] for fid in selected_frame_ids if fid in id_to_li]
         else:
@@ -256,15 +236,18 @@ def generate_composite(
             kf_list_indices,
             threshold=int(seg_threshold),
             morph_size=int(morph_size),
+            dilate_iterations=int(dilate_iter),
+            erode_iterations=int(erode_iter),
+            feather_radius=int(feather_radius),
             opacity=opacity,
             shadow=enable_shadow,
         )
 
         result_rgb = _bgr_to_rgb(result_bgr)
         info = (
-            f"**Panoramic composite** generated with **{len(kf_list_indices)}** subjects.\n"
+            f"**Panoramic composite** with **{len(kf_list_indices)}** subjects.\n"
             f"- Canvas: {pipe.canvas_w} x {pipe.canvas_h}\n"
-            f"- Background expanded from original {_processor.width}x{_processor.height}"
+            f"- Backdrop frames used: {min(int(backdrop_density), len(frames_bgr))}"
         )
         return result_rgb, info
 
@@ -275,8 +258,7 @@ def generate_composite(
         threshold_auto = max(10, 60 - int(sensitivity))
         selected_indices = auto_select_keyframes(
             _all_section_frames, background,
-            num_keyframes=int(num_keyframes),
-            threshold=threshold_auto,
+            num_keyframes=int(num_keyframes), threshold=threshold_auto,
         )
     else:
         total = len(frames_bgr)
@@ -296,6 +278,10 @@ def generate_composite(
                 frame, background,
                 threshold=int(seg_threshold),
                 morph_size=int(morph_size),
+                min_contour_area=min_area,
+                dilate_iterations=int(dilate_iter),
+                erode_iterations=int(erode_iter),
+                feather_radius=int(feather_radius),
             )
             keyframe_bgr.append(frame)
             keyframe_masks.append(mask)
@@ -308,12 +294,11 @@ def generate_composite(
         opacity=opacity, shadow=enable_shadow,
     )
     result_rgb = _bgr_to_rgb(result_bgr)
-    info = f"Composite generated with **{len(keyframe_bgr)}** subjects on clean background."
+    info = f"Composite with **{len(keyframe_bgr)}** subjects on clean background."
     return result_rgb, info
 
 
 def save_image(image):
-    """Save the composite image to a temporary file and return the path."""
     if image is None:
         return None
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, prefix="stopmotion_")
@@ -322,123 +307,57 @@ def save_image(image):
 
 
 # ---------------------------------------------------------------------------
-# Example image generator (synthetic panoramic example)
+# Example image (inline)
 # ---------------------------------------------------------------------------
 
 def generate_example_image():
-    """Generate a synthetic example of a panoramic stop-motion output."""
     w, h = 1600, 600
     bg = np.zeros((h, w, 3), dtype=np.uint8)
-
-    # Wide sky gradient
     for y in range(h):
-        ratio = y / h
-        b = int(220 - 80 * ratio)
-        g = int(190 - 90 * ratio)
-        r = int(90 - 40 * ratio)
-        bg[y, :] = [max(0, b), max(0, g), max(0, r)]
-
-    # Ground
-    slope_pts = np.array([
-        [0, h], [0, int(h * 0.72)],
-        [int(w * 0.3), int(h * 0.78)],
-        [int(w * 0.7), int(h * 0.82)],
-        [w, int(h * 0.75)], [w, h],
-    ], np.int32)
-    cv2.fillPoly(bg, [slope_pts], (120, 160, 80))
-
-    # Panoramic expansion indicator arrows
-    cv2.arrowedLine(bg, (20, h // 2), (60, h // 2), (200, 200, 255), 2, tipLength=0.5)
-    cv2.arrowedLine(bg, (w - 20, h // 2), (w - 60, h // 2), (200, 200, 255), 2, tipLength=0.5)
-
+        r = y / h
+        bg[y, :] = [max(0, int(220 - 80 * r)), max(0, int(190 - 90 * r)), max(0, int(90 - 40 * r))]
+    slope = np.array([[0, h], [0, int(h * .72)], [int(w * .3), int(h * .78)],
+                       [int(w * .7), int(h * .82)], [w, int(h * .75)], [w, h]], np.int32)
+    cv2.fillPoly(bg, [slope], (120, 160, 80))
     result = bg.copy()
-
-    # Draw athlete poses across wide panoramic canvas
-    num_poses = 9
-    color = (20, 100, 240)  # Orange BGR
-    for i in range(num_poses):
-        t = i / (num_poses - 1)
+    num = 9
+    color = (20, 100, 240)
+    for i in range(num):
+        t = i / (num - 1)
         cx = int(80 + t * (w - 160))
-        cy = int(h * 0.65 - 120 * np.sin(t * np.pi * 0.8))
-
+        cy = int(h * .65 - 120 * np.sin(t * np.pi * .8))
         rad = np.radians(t * 90 - 30)
-        cos_r, sin_r = np.cos(rad), np.sin(rad)
-
+        c, s = np.cos(rad), np.sin(rad)
         def rot(dx, dy):
-            rx = int(cx + dx * cos_r - dy * sin_r)
-            ry = int(cy + dx * sin_r + dy * cos_r)
-            return (rx, ry)
-
-        # Shadow
-        sy = int(h * 0.75 + (1 - np.sin(t * np.pi * 0.8)) * 15)
-        overlay = result.copy()
-        cv2.ellipse(overlay, (cx, sy), (18, 5), 0, 0, 360, (80, 120, 50), -1)
-        cv2.addWeighted(overlay, 0.15, result, 0.85, 0, result)
-
-        # Body
-        p_shoulder = rot(0, -18)
-        p_hip = rot(0, 18)
-        cv2.line(result, p_shoulder, p_hip, color, 5, cv2.LINE_AA)
-        p_head = rot(0, -28)
-        cv2.circle(result, p_head, 9, color, -1, cv2.LINE_AA)
-        for adx, ady in [(-25, -5), (22, -12)]:
-            arm_end = rot(adx, ady)
-            cv2.line(result, p_shoulder, arm_end, color, 3, cv2.LINE_AA)
-        for ldx, ldy in [(-8, 38), (8, 38)]:
-            leg_end = rot(ldx, ldy)
-            cv2.line(result, p_hip, leg_end, color, 4, cv2.LINE_AA)
-
-        # Time label
-        label = f"t={t * 3.0:.1f}s"
-        cv2.putText(result, label, (cx - 18, cy + 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-
-    # Trajectory arc
-    for i in range(300):
-        t = i / 299
-        px = int(80 + t * (w - 160))
-        py = int(h * 0.65 - 120 * np.sin(t * np.pi * 0.8))
-        if i % 6 < 3:
-            cv2.circle(result, (px, py), 1, (200, 210, 255), -1, cv2.LINE_AA)
-
-    # Banner
+            return (int(cx + dx * c - dy * s), int(cy + dx * s + dy * c))
+        cv2.line(result, rot(0, -18), rot(0, 18), color, 5, cv2.LINE_AA)
+        cv2.circle(result, rot(0, -28), 9, color, -1, cv2.LINE_AA)
+        for a in [(-25, -5), (22, -12)]:
+            cv2.line(result, rot(0, -18), rot(*a), color, 3, cv2.LINE_AA)
+        for l in [(-8, 38), (8, 38)]:
+            cv2.line(result, rot(0, 18), rot(*l), color, 4, cv2.LINE_AA)
     banner = result.copy()
-    cv2.rectangle(banner, (0, 0), (w, 60), (60, 40, 20), -1)
-    cv2.addWeighted(banner, 0.6, result, 0.4, 0, result)
-
+    cv2.rectangle(banner, (0, 0), (w, 55), (60, 40, 20), -1)
+    cv2.addWeighted(banner, .6, result, .4, 0, result)
     cv2.putText(result, "PANORAMIC STOP-MOTION  |  Moving Camera", (20, 32),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(result, f"{num_poses} keyframes stitched onto expanded panoramic background",
-                (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 210), 1, cv2.LINE_AA)
-
-    # Frame boundary indicators
-    frame_w = _approx_frame_w(w, num_poses)
-    for i in range(1, 4):
-        x = int(w * i / 4)
-        cv2.line(result, (x, 62), (x, 72), (180, 180, 200), 1, cv2.LINE_AA)
-
+                cv2.FONT_HERSHEY_SIMPLEX, .85, (255, 255, 255), 2, cv2.LINE_AA)
     return _bgr_to_rgb(result)
 
 
-def _approx_frame_w(canvas_w, n):
-    return canvas_w // max(1, n - 1)
+EXAMPLE_IMAGE = generate_example_image()
 
 
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
-EXAMPLE_IMAGE = generate_example_image()
-
 CSS = """
 .main-title { text-align: center; margin-bottom: 0; }
 .step-header {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    padding: 8px 16px;
-    border-radius: 8px;
-    margin-bottom: 8px;
+    color: white; padding: 8px 16px; border-radius: 8px; margin-bottom: 8px;
 }
+.guide-text { font-size: 0.88em; color: #555; margin-top: -4px; }
 """
 
 with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=gr.themes.Soft()) as demo:
@@ -452,26 +371,21 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
     )
 
     with gr.Tabs():
-        # ── Tab: Example ──────────────────────────────────────────────
+        # ── Example ───────────────────────────────────────────────────
         with gr.TabItem("Example Output"):
             gr.Markdown("### What the output looks like")
+            gr.Image(value=EXAMPLE_IMAGE, label="Panoramic stop-motion composite", interactive=False)
             gr.Markdown(
-                "The tool extracts keyframes from a video clip and composites each "
-                "frame's subject onto a clean background. For **moving camera** footage, "
-                "frames are aligned via homography and stitched into a wide panoramic canvas."
-            )
-            gr.Image(value=EXAMPLE_IMAGE, label="Example: Panoramic stop-motion composite (moving camera)", interactive=False)
-            gr.Markdown(
-                "**How it works (moving camera):**\n"
-                "1. Feature points (ORB) are detected and matched between consecutive frames\n"
-                "2. Homographies align all frames to a common reference coordinate system\n"
-                "3. Aligned frames are stitched into an **expanded panoramic background** (wider than any single frame)\n"
-                "4. The moving subject is segmented by diffing each warped keyframe against the panorama\n"
-                "5. All segmented subjects are composited onto the panoramic background\n\n"
-                "**Static camera** mode uses the simpler median-background approach."
+                "**Moving camera workflow:**\n"
+                "1. Feature points are detected and matched between frames\n"
+                "2. Frames are aligned to a common reference via affine transforms\n"
+                "3. A sparse subset of frames are stitched into an **expanded panoramic background**\n"
+                "4. The subject is segmented by diffing each keyframe against the panorama\n"
+                "5. All subjects are composited onto the wide panoramic canvas\n\n"
+                "**Static camera** uses pixel-wise median to estimate the background."
             )
 
-        # ── Tab: Main workflow ────────────────────────────────────────
+        # ── Main workflow ─────────────────────────────────────────────
         with gr.TabItem("Create Stop-Motion"):
 
             # Camera mode
@@ -480,12 +394,17 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
                 ["Moving Camera", "Static Camera"],
                 value="Moving Camera",
                 label="Camera Mode",
-                info="Moving Camera: pans/follows subject → panoramic stitching. "
-                     "Static Camera: tripod/fixed → median background.",
+                info="Moving Camera: camera pans/tracks the subject → builds a wide panoramic background. "
+                     "Static Camera: camera is on a tripod → uses median pixel values for background.",
             )
 
-            # Step 1: Load video
+            # Step 1
             gr.Markdown("## Step 1 — Import Video", elem_classes=["step-header"])
+            gr.Markdown(
+                "Upload a video clip. For best results use footage where the **subject moves across the frame** "
+                "(e.g. a jump, sprint, swing). Clips of 1–5 seconds work best.",
+                elem_classes=["guide-text"],
+            )
             with gr.Row():
                 with gr.Column(scale=1):
                     video_input = gr.Video(label="Upload Video", include_audio=False)
@@ -494,8 +413,13 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
                     preview_image = gr.Image(label="Video Preview", interactive=False)
                     video_info = gr.Markdown("No video loaded.")
 
-            # Step 2: Select section
+            # Step 2
             gr.Markdown("## Step 2 — Select Video Section", elem_classes=["step-header"])
+            gr.Markdown(
+                "Choose the start and end times to isolate the action you want to capture. "
+                "Keep it tight — just the movement itself (takeoff to landing, first step to finish, etc.).",
+                elem_classes=["guide-text"],
+            )
             with gr.Row():
                 start_time = gr.Slider(0, 10, value=0, step=0.05, label="Start Time (seconds)")
                 end_time = gr.Slider(0, 10, value=2, step=0.05, label="End Time (seconds)")
@@ -503,48 +427,144 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
             section_info = gr.Markdown("")
             section_gallery = gr.Gallery(label="Section Frames", columns=5, height=250)
 
-            # Step 3: Align & stitch (moving camera)
+            # Step 3: Panorama
             gr.Markdown("## Step 3 — Align & Stitch Panorama", elem_classes=["step-header"])
             gr.Markdown(
-                "*(Moving Camera only)* Aligns all frames using feature matching and "
-                "builds an expanded panoramic background. Skip this step for static camera."
+                "*(Moving Camera only — skip for Static Camera)*\n\n"
+                "Aligns all frames to a common coordinate system and builds a wide panoramic backdrop. "
+                "The panorama only needs to be **good enough as an anchor** for placing subjects — "
+                "not pixel-perfect. Use a low **Backdrop Density** for speed, or increase it if "
+                "the background looks patchy.",
+                elem_classes=["guide-text"],
             )
             with gr.Row():
-                bg_method = gr.Radio(["median", "overlay"], value="median", label="Background Blend Method",
-                                     info="median: cleaner (removes subject). overlay: faster.")
-                stitch_btn = gr.Button("Align & Build Panorama", variant="primary")
+                bg_method = gr.Radio(
+                    ["median", "overlay"], value="median",
+                    label="Background Blend",
+                    info="median: averages overlapping pixels, removes the subject from the backdrop. "
+                         "overlay: just paints frames on top, fastest but subject may ghost through.",
+                )
+                backdrop_density = gr.Slider(
+                    3, 30, value=12, step=1,
+                    label="Backdrop Density",
+                    info="How many evenly-spaced frames to use for building the panorama. "
+                         "Lower = faster & less memory (good for 5+ second clips). "
+                         "Higher = smoother backdrop. 8–15 is usually enough.",
+                )
+            stitch_btn = gr.Button("Align & Build Panorama", variant="primary")
             panorama_info = gr.Markdown("")
             panorama_preview = gr.Image(label="Panoramic Background Preview", interactive=False)
 
-            # Step 4: Keyframe selection
+            # Step 4: Keyframes
             gr.Markdown("## Step 4 — Select Keyframes", elem_classes=["step-header"])
+            gr.Markdown(
+                "Choose how many subject poses to include and how they're picked.\n\n"
+                "- **Auto** analyses the subject's position and picks frames that are maximally "
+                "spread across the image — best for even visual spacing.\n"
+                "- **Uniform** picks frames at equal time intervals — best when you want "
+                "consistent temporal spacing.",
+                elem_classes=["guide-text"],
+            )
             with gr.Row():
                 with gr.Column():
-                    num_keyframes = gr.Slider(3, 15, value=7, step=1, label="Number of Keyframes")
+                    num_keyframes = gr.Slider(
+                        3, 15, value=7, step=1,
+                        label="Number of Keyframes",
+                        info="How many subject poses appear in the final image. "
+                             "More = denser trajectory, fewer = cleaner image.",
+                    )
                     selection_mode = gr.Radio(
                         ["Auto (movement-based)", "Uniform spacing"],
                         value="Auto (movement-based)",
                         label="Selection Mode",
                     )
-                    sensitivity = gr.Slider(10, 50, value=30, step=1,
-                                            label="Detection Sensitivity (higher = more sensitive)")
+                    sensitivity = gr.Slider(
+                        10, 50, value=30, step=1,
+                        label="Detection Sensitivity",
+                        info="How aggressively the auto-selector detects the subject. "
+                             "Increase if the subject is faint or similar to the background. "
+                             "Decrease if noise is being picked up.",
+                    )
                 with gr.Column():
                     keyframe_btn = gr.Button("Preview Keyframes", variant="secondary")
                     keyframe_info = gr.Markdown("")
             keyframe_gallery = gr.Gallery(label="Selected Keyframes", columns=4, height=250)
 
-            # Step 5: Generate composite
+            # Step 5: Generate
             gr.Markdown("## Step 5 — Generate Stop-Motion Image", elem_classes=["step-header"])
+            gr.Markdown(
+                "Fine-tune segmentation and compositing. The controls below affect how cleanly "
+                "the subject is cut out and blended onto the background.",
+                elem_classes=["guide-text"],
+            )
             with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### Fine-tune Parameters")
-                    seg_threshold = gr.Slider(10, 80, value=35, step=1, label="Segmentation Threshold")
-                    morph_size = gr.Slider(3, 15, value=7, step=2, label="Morph Kernel Size")
-                    opacity = gr.Slider(0.5, 1.0, value=1.0, step=0.05, label="Subject Opacity")
-                    enable_shadow = gr.Checkbox(value=True, label="Add Drop Shadow")
+                with gr.Column(scale=2):
+                    gr.Markdown("### Segmentation Controls")
+                    gr.Markdown(
+                        "These controls determine how the subject is separated from the background. "
+                        "Adjust them if the subject has missing parts or if background leaks through.",
+                        elem_classes=["guide-text"],
+                    )
+                    seg_threshold = gr.Slider(
+                        10, 80, value=35, step=1,
+                        label="Segmentation Threshold",
+                        info="Pixel-difference cutoff for detecting the subject. "
+                             "LOWER = picks up fainter edges (try 15–25 for subjects that blend with the background). "
+                             "HIGHER = stricter, removes background noise (try 40–60 if too much junk is detected).",
+                    )
+                    morph_size = gr.Slider(
+                        3, 15, value=7, step=2,
+                        label="Morph Kernel Size",
+                        info="Size of the cleanup kernel. Larger values fill gaps in the mask "
+                             "(good if the subject has holes) but can merge nearby objects. "
+                             "Start at 7; increase to 11–15 for distant/small subjects.",
+                    )
+                    dilate_iter = gr.Slider(
+                        0, 8, value=0, step=1,
+                        label="Dilate (expand mask)",
+                        info="Grow the subject outline outward. Use 1–3 to recover clipped "
+                             "edges (hair, equipment, limbs). 0 = no extra dilation.",
+                    )
+                    erode_iter = gr.Slider(
+                        0, 8, value=0, step=1,
+                        label="Erode (shrink mask)",
+                        info="Shrink the subject outline inward. Use 1–3 to remove thin "
+                             "background halo around the subject. 0 = no extra erosion.",
+                    )
+                    feather_radius = gr.Slider(
+                        0, 20, value=3, step=1,
+                        label="Edge Feathering",
+                        info="Softens the edge of the cut-out. 0 = hard pixel edge (may look jagged). "
+                             "3–5 = natural soft blend. 10–20 = very soft/dreamy edge.",
+                    )
+                    min_object_pct = gr.Slider(
+                        0.01, 5.0, value=0.1, step=0.01,
+                        label="Min Object Size (%)",
+                        info="Discard detected blobs smaller than this percentage of the image area. "
+                             "Increase to 0.5–2.0 if small noise patches appear. "
+                             "Decrease to 0.01–0.05 for small/distant subjects.",
+                    )
+
+                    gr.Markdown("### Compositing Controls")
+                    gr.Markdown(
+                        "These affect how the cut-out subjects are placed onto the background.",
+                        elem_classes=["guide-text"],
+                    )
+                    opacity = gr.Slider(
+                        0.3, 1.0, value=1.0, step=0.05,
+                        label="Subject Opacity",
+                        info="1.0 = fully opaque subjects. Lower values make subjects semi-transparent, "
+                             "useful for showing the background through overlapping poses.",
+                    )
+                    enable_shadow = gr.Checkbox(
+                        value=True, label="Add Drop Shadow",
+                        info="Adds a subtle shadow behind each subject for depth and separation.",
+                    )
+
                     generate_btn = gr.Button("Generate Composite", variant="primary", size="lg")
                     composite_info = gr.Markdown("")
-                with gr.Column(scale=2):
+
+                with gr.Column(scale=3):
                     composite_output = gr.Image(label="Stop-Motion Composite", interactive=False)
                     save_btn = gr.Button("Save Full Resolution", variant="secondary")
                     save_output = gr.File(label="Download")
@@ -565,7 +585,7 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
 
     stitch_btn.click(
         fn=align_and_stitch,
-        inputs=[bg_method],
+        inputs=[bg_method, backdrop_density],
         outputs=[panorama_preview, panorama_info],
     )
 
@@ -584,7 +604,9 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
         fn=generate_composite,
         inputs=[
             num_keyframes, selection_mode, sensitivity, camera_mode,
-            bg_method, seg_threshold, morph_size, opacity, enable_shadow,
+            bg_method, backdrop_density,
+            seg_threshold, morph_size, dilate_iter, erode_iter, feather_radius,
+            min_object_pct, opacity, enable_shadow,
         ],
         outputs=[composite_output, composite_info],
     )

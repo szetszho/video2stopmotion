@@ -99,10 +99,29 @@ def estimate_background(frames: list[np.ndarray], method: str = "median") -> np.
 
 def segment_foreground(frame: np.ndarray, background: np.ndarray,
                        threshold: int = 40, morph_size: int = 7,
-                       min_contour_area: float = 0.001) -> np.ndarray:
+                       min_contour_area: float = 0.001,
+                       dilate_iterations: int = 0,
+                       erode_iterations: int = 0,
+                       feather_radius: int = 3) -> np.ndarray:
     """Segment the foreground subject from the background.
 
     Returns an alpha mask (0-255) where 255 = foreground.
+
+    Refinement controls:
+        threshold:        Pixel-difference cutoff. Lower → picks up fainter
+                          edges (good for similar-colour subjects). Higher →
+                          stricter, removes background noise.
+        morph_size:       Kernel for morphological close/open.  Larger values
+                          bridge bigger gaps in the mask but can merge nearby
+                          objects.
+        min_contour_area: Fraction of image area.  Blobs smaller than this
+                          are discarded as noise.
+        dilate_iterations: Grow the mask outward by this many steps.  Use to
+                          recover clipped edges (hair, equipment).
+        erode_iterations:  Shrink the mask inward.  Use to remove thin
+                          background leaking around the subject.
+        feather_radius:   Gaussian blur radius applied to the final mask
+                          (0 = hard edge, higher = softer blend).
     """
     diff = cv2.absdiff(frame, background)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
@@ -113,6 +132,15 @@ def segment_foreground(frame: np.ndarray, background: np.ndarray,
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
+    # Extra dilation / erosion for fine-tuning
+    if dilate_iterations > 0:
+        dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(mask, dk, iterations=dilate_iterations)
+    if erode_iterations > 0:
+        ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.erode(mask, ek, iterations=erode_iterations)
+
+    # Keep only large contours
     h, w = mask.shape
     min_area = min_contour_area * h * w
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -121,7 +149,11 @@ def segment_foreground(frame: np.ndarray, background: np.ndarray,
         if cv2.contourArea(cnt) >= min_area:
             cv2.drawContours(filled_mask, [cnt], -1, 255, -1)
 
-    filled_mask = cv2.GaussianBlur(filled_mask, (5, 5), 0)
+    # Edge feathering
+    if feather_radius > 0:
+        k = feather_radius * 2 + 1  # must be odd
+        filled_mask = cv2.GaussianBlur(filled_mask, (k, k), 0)
+
     return filled_mask
 
 
@@ -286,66 +318,85 @@ def compute_panorama_bounds(frames: list[np.ndarray],
 
 def build_panoramic_background(frames: list[np.ndarray],
                                cumulative_H: list[np.ndarray],
-                               method: str = "median") -> tuple:
+                               method: str = "median",
+                               backdrop_density: int = 12,
+                               max_canvas_dim: int = 6000) -> tuple:
     """Build an expanded panoramic background from aligned frames.
 
+    The panorama serves as a backdrop for anchoring overlay subjects and
+    expanding the canvas — it does NOT need to be pixel-perfect.  Only a
+    sparse subset of frames is used, keeping memory bounded even for long
+    clips (5-10+ seconds / hundreds of frames).
+
+    Args:
+        frames:         All section frames (BGR).
+        cumulative_H:   Per-frame homographies (frame → reference).
+        method:         'median' averages overlapping pixels (removes the
+                        moving subject) or 'overlay' paints later frames on
+                        top (fastest).
+        backdrop_density: How many evenly-spaced frames to use for the
+                        backdrop.  5 is minimal / fast, 20 is high quality.
+                        Default 12 balances quality and memory.
+        max_canvas_dim: Hard cap on the wider canvas dimension (pixels).
+                        Prevents runaway memory on very long pans.
+
     Returns (panorama_bgr, canvas_w, canvas_h, offset_H).
-    The offset_H should be composed with cumulative_H to warp frames
-    into panorama coordinates.
     """
     _, _, _, _, canvas_w, canvas_h, offset_H = compute_panorama_bounds(
         frames, cumulative_H
     )
 
-    # Cap canvas size to avoid memory issues
-    max_dim = 8000
-    if canvas_w > max_dim or canvas_h > max_dim:
-        scale = max_dim / max(canvas_w, canvas_h)
-        scale_H = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=np.float64)
+    # Scale canvas down if it exceeds the hard cap
+    if canvas_w > max_canvas_dim or canvas_h > max_canvas_dim:
+        scale = max_canvas_dim / max(canvas_w, canvas_h)
+        scale_H = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]],
+                           dtype=np.float64)
         offset_H = scale_H @ offset_H
         canvas_w = int(canvas_w * scale)
         canvas_h = int(canvas_h * scale)
 
-    # Warp all frames (subsample if many) and build panorama
-    max_for_bg = 40
-    if len(frames) > max_for_bg:
-        indices = np.linspace(0, len(frames) - 1, max_for_bg, dtype=int)
+    # ── Subsample frames for the backdrop ──────────────────────────────
+    # Only use `backdrop_density` evenly-spaced frames.  This is the key
+    # optimisation: even a 5-second clip at 30 fps (150 frames) only
+    # warps ~12 frames instead of 150 — a 12× memory and speed saving.
+    n_bg = max(3, min(backdrop_density, len(frames)))
+    if len(frames) > n_bg:
+        indices = np.linspace(0, len(frames) - 1, n_bg, dtype=int).tolist()
     else:
         indices = list(range(len(frames)))
 
-    if method == "median" and len(indices) >= 5:
-        # Median blending: stack warped frames and take median per-pixel
-        # Use float32 accumulation for memory efficiency on large canvases
+    if method == "median" and len(indices) >= 3:
+        # Median blending: stack warped frames and take per-pixel median.
+        # NaN-masked so only pixels with actual coverage contribute.
         warped_stack = []
         mask_stack = []
         for i in indices:
             H_total = offset_H @ cumulative_H[i]
-            warped = cv2.warpPerspective(frames[i], H_total, (canvas_w, canvas_h))
-            # Build a mask of valid (non-black) pixels
+            warped = cv2.warpPerspective(frames[i], H_total,
+                                         (canvas_w, canvas_h))
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             valid = (gray > 0).astype(np.uint8)
             warped_stack.append(warped)
             mask_stack.append(valid)
 
-        # For each pixel, compute median over valid (non-zero) contributions
-        stack = np.stack(warped_stack, axis=0).astype(np.float32)  # (N, H, W, 3)
-        masks = np.stack(mask_stack, axis=0)  # (N, H, W)
+        stack = np.stack(warped_stack, axis=0).astype(np.float32)
+        masks = np.stack(mask_stack, axis=0)
 
-        # Replace zeros with NaN so they don't affect the median
         for c in range(3):
-            stack[:, :, :, c] = np.where(masks > 0, stack[:, :, :, c], np.nan)
+            stack[:, :, :, c] = np.where(masks > 0,
+                                         stack[:, :, :, c], np.nan)
 
         with np.errstate(invalid='ignore'):
             panorama = np.nanmedian(stack, axis=0)
 
-        # Fill any remaining NaN with 0
         panorama = np.nan_to_num(panorama, nan=0.0).astype(np.uint8)
     else:
-        # Simple overlay: later frames overwrite earlier ones
+        # Simple overlay: later frames overwrite earlier ones (fastest)
         panorama = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         for i in indices:
             H_total = offset_H @ cumulative_H[i]
-            warped = cv2.warpPerspective(frames[i], H_total, (canvas_w, canvas_h))
+            warped = cv2.warpPerspective(frames[i], H_total,
+                                         (canvas_w, canvas_h))
             mask = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) > 0
             panorama[mask] = warped[mask]
 
@@ -356,13 +407,19 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
                               H_to_panorama: np.ndarray,
                               canvas_w: int, canvas_h: int,
                               threshold: int = 35, morph_size: int = 7,
-                              min_contour_area: float = 0.002) -> tuple:
+                              min_contour_area: float = 0.002,
+                              dilate_iterations: int = 0,
+                              erode_iterations: int = 0,
+                              feather_radius: int = 3) -> tuple:
     """Segment the moving subject on the panoramic canvas.
 
     Warps the frame into panorama coordinates, computes difference
     against the panoramic background, and extracts the foreground.
 
     Returns (warped_frame, foreground_mask) in panorama coordinates.
+
+    See segment_foreground() for parameter descriptions — they behave
+    identically here but operate on the warped panoramic canvas.
     """
     warped = cv2.warpPerspective(frame, H_to_panorama, (canvas_w, canvas_h))
 
@@ -370,9 +427,9 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
     warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     valid_mask = (warped_gray > 2).astype(np.uint8) * 255
 
-    # Erode valid mask slightly to avoid edge artifacts from warping
-    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    valid_mask = cv2.erode(valid_mask, erode_kernel, iterations=2)
+    # Erode valid mask to avoid edge artifacts from warping
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    valid_mask = cv2.erode(valid_mask, erode_k, iterations=2)
 
     # Difference against panoramic background
     diff = cv2.absdiff(warped, panorama)
@@ -380,8 +437,6 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
     blurred = cv2.GaussianBlur(gray_diff, (7, 7), 0)
 
     _, fg_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
-
-    # Only keep foreground within the valid warped region
     fg_mask = cv2.bitwise_and(fg_mask, valid_mask)
 
     # Morphological cleanup
@@ -389,17 +444,28 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    # Keep only large contours (the subject)
+    # Extra dilation / erosion
+    if dilate_iterations > 0:
+        dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fg_mask = cv2.dilate(fg_mask, dk, iterations=dilate_iterations)
+    if erode_iterations > 0:
+        ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fg_mask = cv2.erode(fg_mask, ek, iterations=erode_iterations)
+
+    # Keep only large contours
     total_area = canvas_h * canvas_w
     min_area = min_contour_area * total_area
-    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
     clean_mask = np.zeros_like(fg_mask)
     for cnt in contours:
         if cv2.contourArea(cnt) >= min_area:
             cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
 
-    # Feather edges
-    clean_mask = cv2.GaussianBlur(clean_mask, (5, 5), 0)
+    # Edge feathering
+    if feather_radius > 0:
+        k = feather_radius * 2 + 1
+        clean_mask = cv2.GaussianBlur(clean_mask, (k, k), 0)
 
     return warped, clean_mask
 
@@ -593,11 +659,18 @@ class PanoramicPipeline:
             max_features=max_features, use_affine=use_affine,
         )
 
-    def build_panorama(self, method: str = "median"):
-        """Build the expanded panoramic background."""
+    def build_panorama(self, method: str = "median",
+                       backdrop_density: int = 12):
+        """Build the expanded panoramic background.
+
+        Args:
+            backdrop_density: Number of evenly-spaced frames to use.
+                Lower = faster & less memory, higher = smoother backdrop.
+        """
         self.panorama, self.canvas_w, self.canvas_h, self.offset_H = \
             build_panoramic_background(
                 self.frames, self.cumulative_H, method=method,
+                backdrop_density=backdrop_density,
             )
 
     def get_panorama_preview(self) -> Optional[np.ndarray]:
@@ -605,8 +678,10 @@ class PanoramicPipeline:
         return self.panorama
 
     def segment_keyframe(self, frame_list_index: int,
-                         threshold: int = 35,
-                         morph_size: int = 7) -> tuple:
+                         threshold: int = 35, morph_size: int = 7,
+                         dilate_iterations: int = 0,
+                         erode_iterations: int = 0,
+                         feather_radius: int = 3) -> tuple:
         """Segment the subject from a keyframe in panorama coords.
         Returns (warped_frame, mask) on the panoramic canvas."""
         if frame_list_index >= len(self.cumulative_H):
@@ -617,17 +692,28 @@ class PanoramicPipeline:
             self.frames[frame_list_index], self.panorama,
             H_total, self.canvas_w, self.canvas_h,
             threshold=threshold, morph_size=morph_size,
+            dilate_iterations=dilate_iterations,
+            erode_iterations=erode_iterations,
+            feather_radius=feather_radius,
         )
 
     def generate(self, keyframe_list_indices: list[int],
                  threshold: int = 35, morph_size: int = 7,
+                 dilate_iterations: int = 0,
+                 erode_iterations: int = 0,
+                 feather_radius: int = 3,
                  opacity: float = 1.0, shadow: bool = True) -> np.ndarray:
         """Generate the final panoramic stop-motion composite."""
         warped_frames = []
         masks = []
 
         for li in keyframe_list_indices:
-            warped, mask = self.segment_keyframe(li, threshold, morph_size)
+            warped, mask = self.segment_keyframe(
+                li, threshold, morph_size,
+                dilate_iterations=dilate_iterations,
+                erode_iterations=erode_iterations,
+                feather_radius=feather_radius,
+            )
             warped_frames.append(warped)
             masks.append(mask)
 

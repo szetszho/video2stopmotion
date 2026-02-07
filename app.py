@@ -27,6 +27,7 @@ from video_processor import (
     auto_select_keyframes,
     auto_select_keyframes_moving,
     PanoramicPipeline,
+    DirectCompositePipeline,
     _AI_AVAILABLE,
 )
 
@@ -205,9 +206,44 @@ def pick_keyframes_uniform(num_keyframes):
 # Step 5 — Generate composite
 # ---------------------------------------------------------------------------
 
+def _select_keyframe_indices(num_keyframes, selection_mode, sensitivity,
+                              camera_mode):
+    """Pick keyframe list-indices from the extracted section frames."""
+    frames_bgr = [f for _, f in _all_section_frames]
+    total = len(frames_bgr)
+    n = int(num_keyframes)
+
+    if selection_mode == "Uniform spacing":
+        if total <= n:
+            return list(range(total))
+        return [int(i * (total - 1) / (n - 1)) for i in range(n)]
+
+    # Auto (movement-based)
+    if camera_mode == "Moving Camera" and _panoramic_pipeline is not None:
+        pipe = _panoramic_pipeline
+        thresh = max(10, 60 - int(sensitivity))
+        selected_ids = auto_select_keyframes_moving(
+            _all_section_frames, pipe.panorama,
+            pipe.cumulative_H, pipe.offset_H,
+            pipe.canvas_w, pipe.canvas_h,
+            num_keyframes=n, threshold=thresh,
+        )
+        id_to_li = {fid: li for li, (fid, _) in enumerate(_all_section_frames)}
+        return [id_to_li[fid] for fid in selected_ids if fid in id_to_li]
+
+    # Static or no panorama available — use static auto-select
+    background = estimate_background(frames_bgr, method="median")
+    thresh = max(10, 60 - int(sensitivity))
+    selected_ids = auto_select_keyframes(
+        _all_section_frames, background, num_keyframes=n, threshold=thresh,
+    )
+    id_to_li = {fid: li for li, (fid, _) in enumerate(_all_section_frames)}
+    return [id_to_li.get(fid, 0) for fid in selected_ids]
+
+
 def generate_composite(
     num_keyframes, selection_mode, sensitivity, camera_mode,
-    bg_method, backdrop_density, alignment_method,
+    pipeline_mode, bg_method, backdrop_density, alignment_method,
     seg_method, ai_model,
     seg_threshold, morph_size, dilate_iter, erode_iter, feather_radius,
     min_object_pct, opacity, enable_shadow,
@@ -219,7 +255,60 @@ def generate_composite(
     min_area = float(min_object_pct) / 100.0
     use_ai_seg = (seg_method == "AI Model") and _AI_AVAILABLE
 
-    # ── Moving camera path ────────────────────────────────────────────
+    # ── Direct pipeline (new lightweight approach) ────────────────────
+    if pipeline_mode in ("Direct (keyframes only)", "Opacity Blend (no segmentation)"):
+        kf_indices = _select_keyframe_indices(
+            num_keyframes, selection_mode, sensitivity, camera_mode)
+        keyframes = [frames_bgr[i] for i in kf_indices]
+
+        if not keyframes:
+            return None, "No keyframes could be extracted."
+
+        pipe = DirectCompositePipeline()
+
+        if pipeline_mode == "Opacity Blend (no segmentation)":
+            result_bgr = pipe.generate_opacity_blend(
+                keyframes,
+                alignment_method=alignment_method,
+                opacity=opacity,
+            )
+            result_rgb = _bgr_to_rgb(result_bgr)
+            info = (
+                f"**Multi-exposure blend** with **{len(keyframes)}** frames.\n"
+                f"- Canvas: {pipe.canvas_w} x {pipe.canvas_h}\n"
+                f"- Alignment: **{alignment_method}**\n"
+                f"- No segmentation — pure opacity layering"
+            )
+            return result_rgb, info
+
+        seg_mode_str = "ai" if use_ai_seg else "classical"
+        result_bgr = pipe.generate(
+            keyframes,
+            alignment_method=alignment_method,
+            seg_method=seg_mode_str,
+            ai_model=ai_model,
+            backdrop_method=bg_method,
+            threshold=int(seg_threshold),
+            morph_size=int(morph_size),
+            dilate_iterations=int(dilate_iter),
+            erode_iterations=int(erode_iter),
+            feather_radius=int(feather_radius),
+            min_contour_area=min_area,
+            opacity=opacity,
+            shadow=enable_shadow,
+        )
+
+        seg_label = f"AI ({ai_model})" if use_ai_seg else "Classical"
+        result_rgb = _bgr_to_rgb(result_bgr)
+        info = (
+            f"**Direct composite** with **{len(keyframes)}** subjects.\n"
+            f"- Canvas: {pipe.canvas_w} x {pipe.canvas_h}\n"
+            f"- Alignment: **{alignment_method}** (on {len(keyframes)} frames only)\n"
+            f"- Segmentation: **{seg_label}** (on original frames)"
+        )
+        return result_rgb, info
+
+    # ── Panoramic pipeline (legacy — processes all frames) ────────────
     if camera_mode == "Moving Camera":
         global _panoramic_pipeline
         if _panoramic_pipeline is None:
@@ -231,27 +320,11 @@ def generate_composite(
             )
 
         pipe = _panoramic_pipeline
-
-        if selection_mode == "Auto (movement-based)":
-            thresh_auto = max(10, 60 - int(sensitivity))
-            selected_frame_ids = auto_select_keyframes_moving(
-                _all_section_frames, pipe.panorama,
-                pipe.cumulative_H, pipe.offset_H,
-                pipe.canvas_w, pipe.canvas_h,
-                num_keyframes=int(num_keyframes), threshold=thresh_auto,
-            )
-            id_to_li = {fid: li for li, (fid, _) in enumerate(_all_section_frames)}
-            kf_list_indices = [id_to_li[fid] for fid in selected_frame_ids if fid in id_to_li]
-        else:
-            total = len(frames_bgr)
-            n = int(num_keyframes)
-            if total <= n:
-                kf_list_indices = list(range(total))
-            else:
-                kf_list_indices = [int(i * (total - 1) / (n - 1)) for i in range(n)]
+        kf_indices = _select_keyframe_indices(
+            num_keyframes, selection_mode, sensitivity, camera_mode)
 
         result_bgr = pipe.generate(
-            kf_list_indices,
+            kf_indices,
             threshold=int(seg_threshold),
             morph_size=int(morph_size),
             dilate_iterations=int(dilate_iter),
@@ -263,61 +336,46 @@ def generate_composite(
             ai_model=ai_model,
         )
 
-        seg_label = f"AI ({ai_model})" if use_ai_seg else "Classical (background subtraction)"
+        seg_label = f"AI ({ai_model})" if use_ai_seg else "Classical"
         result_rgb = _bgr_to_rgb(result_bgr)
         info = (
-            f"**Panoramic composite** with **{len(kf_list_indices)}** subjects.\n"
+            f"**Panoramic composite** with **{len(kf_indices)}** subjects.\n"
             f"- Canvas: {pipe.canvas_w} x {pipe.canvas_h}\n"
             f"- Segmentation: **{seg_label}**\n"
-            f"- Backdrop frames used: {min(int(backdrop_density), len(frames_bgr))}"
+            f"- Aligned all {len(frames_bgr)} frames, backdrop from {min(int(backdrop_density), len(frames_bgr))}"
         )
         return result_rgb, info
 
     # ── Static camera path ────────────────────────────────────────────
     background = estimate_background(frames_bgr, method=bg_method)
-
-    if selection_mode == "Auto (movement-based)":
-        threshold_auto = max(10, 60 - int(sensitivity))
-        selected_indices = auto_select_keyframes(
-            _all_section_frames, background,
-            num_keyframes=int(num_keyframes), threshold=threshold_auto,
-        )
-    else:
-        total = len(frames_bgr)
-        n = int(num_keyframes)
-        if total <= n:
-            idxs = list(range(total))
-        else:
-            idxs = [int(i * (total - 1) / (n - 1)) for i in range(n)]
-        selected_indices = [_all_section_frames[i][0] for i in idxs]
+    kf_indices = _select_keyframe_indices(
+        num_keyframes, selection_mode, sensitivity, camera_mode)
 
     keyframe_bgr = []
     keyframe_masks = []
-    for idx in selected_indices:
-        frame = _processor.get_frame(idx)
-        if frame is not None:
-            if use_ai_seg:
-                mask = segment_foreground_ai(
-                    frame,
-                    model_name=ai_model,
-                    morph_size=int(morph_size),
-                    dilate_iterations=int(dilate_iter),
-                    erode_iterations=int(erode_iter),
-                    feather_radius=int(feather_radius),
-                    min_contour_area=min_area,
-                )
-            else:
-                mask = segment_foreground(
-                    frame, background,
-                    threshold=int(seg_threshold),
-                    morph_size=int(morph_size),
-                    min_contour_area=min_area,
-                    dilate_iterations=int(dilate_iter),
-                    erode_iterations=int(erode_iter),
-                    feather_radius=int(feather_radius),
-                )
-            keyframe_bgr.append(frame)
-            keyframe_masks.append(mask)
+    for li in kf_indices:
+        frame = frames_bgr[li]
+        if use_ai_seg:
+            mask = segment_foreground_ai(
+                frame, model_name=ai_model,
+                morph_size=int(morph_size),
+                dilate_iterations=int(dilate_iter),
+                erode_iterations=int(erode_iter),
+                feather_radius=int(feather_radius),
+                min_contour_area=min_area,
+            )
+        else:
+            mask = segment_foreground(
+                frame, background,
+                threshold=int(seg_threshold),
+                morph_size=int(morph_size),
+                min_contour_area=min_area,
+                dilate_iterations=int(dilate_iter),
+                erode_iterations=int(erode_iter),
+                feather_radius=int(feather_radius),
+            )
+        keyframe_bgr.append(frame)
+        keyframe_masks.append(mask)
 
     if not keyframe_bgr:
         return None, "No keyframes could be processed."
@@ -431,27 +489,43 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
             gr.Markdown("### What the output looks like")
             gr.Image(value=EXAMPLE_IMAGE, label="Panoramic stop-motion composite", interactive=False)
             gr.Markdown(
-                "**Moving camera workflow:**\n"
-                "1. Feature points are detected and matched between frames\n"
-                "2. Frames are aligned to a common reference via affine transforms\n"
-                "3. A sparse subset of frames are stitched into an **expanded panoramic background**\n"
-                "4. The subject is segmented by diffing each keyframe against the panorama\n"
-                "5. All subjects are composited onto the wide panoramic canvas\n\n"
+                "**Direct pipeline (recommended):**\n"
+                "1. Pick keyframes from the video section\n"
+                "2. Align only those keyframes to each other (fast — processes 7 frames, not 150)\n"
+                "3. Segment the subject on each **original, un-warped frame** (best quality)\n"
+                "4. Place subjects at their aligned positions on an expanded canvas\n\n"
+                "**Opacity Blend**: Same as Direct but skips segmentation — layers frames with "
+                "transparency for a classic multi-exposure / chronophotography look.\n\n"
+                "**Panoramic (legacy)**: Aligns ALL frames, builds full panorama backdrop, "
+                "then segments via background subtraction. Slower but shows panorama preview.\n\n"
                 "**Static camera** uses pixel-wise median to estimate the background."
             )
 
         # ── Main workflow ─────────────────────────────────────────────
         with gr.TabItem("Create Stop-Motion"):
 
-            # Camera mode
-            gr.Markdown("## Camera Mode", elem_classes=["step-header"])
-            camera_mode = gr.Radio(
-                ["Moving Camera", "Static Camera"],
-                value="Moving Camera",
-                label="Camera Mode",
-                info="Moving Camera: camera pans/tracks the subject → builds a wide panoramic background. "
-                     "Static Camera: camera is on a tripod → uses median pixel values for background.",
-            )
+            # Camera mode + pipeline mode
+            gr.Markdown("## Camera & Pipeline Mode", elem_classes=["step-header"])
+            with gr.Row():
+                camera_mode = gr.Radio(
+                    ["Moving Camera", "Static Camera"],
+                    value="Moving Camera",
+                    label="Camera Mode",
+                    info="Moving Camera: camera pans/tracks the subject. "
+                         "Static Camera: camera on a tripod.",
+                )
+                pipeline_mode = gr.Radio(
+                    [
+                        "Direct (keyframes only)",
+                        "Opacity Blend (no segmentation)",
+                        "Panoramic (legacy)",
+                    ],
+                    value="Direct (keyframes only)",
+                    label="Pipeline Mode",
+                    info="**Direct**: aligns only keyframes, segments on originals — fast & clean. "
+                         "**Opacity Blend**: layers keyframes with transparency, no segmentation — fastest. "
+                         "**Panoramic**: aligns ALL frames, builds full panorama — slower but keeps panorama preview.",
+                )
 
             # Step 1
             gr.Markdown("## Step 1 — Import Video", elem_classes=["step-header"])
@@ -691,7 +765,7 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
         fn=generate_composite,
         inputs=[
             num_keyframes, selection_mode, sensitivity, camera_mode,
-            bg_method, backdrop_density, alignment_method,
+            pipeline_mode, bg_method, backdrop_density, alignment_method,
             seg_method, ai_model,
             seg_threshold, morph_size, dilate_iter, erode_iter, feather_radius,
             min_object_pct, opacity, enable_shadow,

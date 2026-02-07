@@ -698,6 +698,337 @@ def auto_select_keyframes_moving(frames: list[tuple[int, np.ndarray]],
 # High-level pipeline for moving camera
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+# High-level pipeline for moving camera
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DirectCompositePipeline:
+    """Lightweight pipeline: align keyframes → segment on originals → composite.
+
+    Much simpler and more efficient than PanoramicPipeline because:
+      1. Only aligns the keyframes (not all frames in the clip)
+      2. No panorama background build needed
+      3. Segmentation runs on the original, un-warped frames (better quality)
+      4. Backdrop is built cheaply from the keyframes themselves
+
+    The core idea: each keyframe is an original video frame.  We compute
+    where it sits relative to the other keyframes, segment the subject on
+    the crisp original, then place the subject at the correct position on
+    an expanded canvas.  The background is simply the keyframes blended
+    together (or a single reference frame).
+
+    Usage:
+        pipe = DirectCompositePipeline()
+        result = pipe.generate(
+            keyframes_bgr,
+            alignment_method="orb",
+            seg_method="ai", ai_model="u2netp",
+            ...
+        )
+    """
+
+    def __init__(self):
+        self._ai_segmenter = None
+        # Exposed after generate() for UI info
+        self.canvas_w: int = 0
+        self.canvas_h: int = 0
+        self.alignment_method: str = ""
+        self.seg_method: str = ""
+
+    def _align_keyframes(self, keyframes: list[np.ndarray],
+                         method: str = "orb",
+                         max_features: int = 3000) -> list[np.ndarray]:
+        """Align keyframes to a reference (middle frame).
+
+        Only processes the keyframes themselves — not the full video.
+        Returns list of 3x3 homography matrices mapping each keyframe
+        to the reference frame.
+        """
+        n = len(keyframes)
+        if n <= 1:
+            return [np.eye(3, dtype=np.float64)] * n
+
+        ref_index = n // 2
+
+        if method == "flow" and _AI_AVAILABLE:
+            return compute_direct_homographies_flow(keyframes, ref_index)
+        elif method == "flow":
+            logger.warning("Flow requested but AI not available, using ORB")
+
+        return compute_direct_homographies(
+            keyframes, ref_index=ref_index,
+            max_features=max_features, use_affine=True,
+        )
+
+    def _compute_canvas(self, keyframes: list[np.ndarray],
+                        homographies: list[np.ndarray],
+                        max_dim: int = 6000) -> tuple:
+        """Compute canvas size and offset from keyframe positions.
+
+        Returns (canvas_w, canvas_h, offset_H).
+        """
+        h, w = keyframes[0].shape[:2]
+        corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+
+        all_corners = []
+        for H in homographies:
+            warped = cv2.perspectiveTransform(corners, H)
+            all_corners.append(warped)
+
+        all_corners = np.concatenate(all_corners, axis=0)
+        min_x = int(np.floor(all_corners[:, 0, 0].min()))
+        max_x = int(np.ceil(all_corners[:, 0, 0].max()))
+        min_y = int(np.floor(all_corners[:, 0, 1].min()))
+        max_y = int(np.ceil(all_corners[:, 0, 1].max()))
+
+        canvas_w = max_x - min_x
+        canvas_h = max_y - min_y
+
+        offset_H = np.array([
+            [1, 0, -min_x],
+            [0, 1, -min_y],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        # Scale down if too large
+        if canvas_w > max_dim or canvas_h > max_dim:
+            scale = max_dim / max(canvas_w, canvas_h)
+            scale_H = np.diag([scale, scale, 1.0])
+            offset_H = scale_H @ offset_H
+            canvas_w = int(canvas_w * scale)
+            canvas_h = int(canvas_h * scale)
+
+        return canvas_w, canvas_h, offset_H
+
+    def _build_backdrop(self, keyframes: list[np.ndarray],
+                        homographies: list[np.ndarray],
+                        offset_H: np.ndarray,
+                        canvas_w: int, canvas_h: int,
+                        method: str = "median") -> np.ndarray:
+        """Build a lightweight backdrop from the keyframes themselves.
+
+        Much cheaper than building a full panorama — only warps the
+        keyframes (typically 5–10 frames, not hundreds).
+        """
+        if method == "median" and len(keyframes) >= 3:
+            warped_stack = []
+            mask_stack = []
+            for i, kf in enumerate(keyframes):
+                H_total = offset_H @ homographies[i]
+                warped = cv2.warpPerspective(kf, H_total, (canvas_w, canvas_h))
+                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                valid = (gray > 0).astype(np.uint8)
+                warped_stack.append(warped)
+                mask_stack.append(valid)
+
+            stack = np.stack(warped_stack, axis=0).astype(np.float32)
+            masks = np.stack(mask_stack, axis=0)
+            for c in range(3):
+                stack[:, :, :, c] = np.where(masks > 0, stack[:, :, :, c], np.nan)
+
+            with np.errstate(invalid='ignore'):
+                backdrop = np.nanmedian(stack, axis=0)
+            backdrop = np.nan_to_num(backdrop, nan=0.0).astype(np.uint8)
+        else:
+            backdrop = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+            for i, kf in enumerate(keyframes):
+                H_total = offset_H @ homographies[i]
+                warped = cv2.warpPerspective(kf, H_total, (canvas_w, canvas_h))
+                mask = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) > 0
+                backdrop[mask] = warped[mask]
+
+        return backdrop
+
+    def _segment_frame(self, frame_bgr: np.ndarray,
+                       seg_method: str = "ai",
+                       ai_model: str = "u2netp",
+                       morph_size: int = 5,
+                       dilate_iterations: int = 0,
+                       erode_iterations: int = 0,
+                       feather_radius: int = 3,
+                       min_contour_area: float = 0.001,
+                       threshold: int = 35) -> np.ndarray:
+        """Segment a single frame on the ORIGINAL (un-warped) image.
+
+        With AI: uses neural network (no background needed).
+        Without AI: returns a full-frame mask (subject = entire frame).
+        Classical background subtraction doesn't apply in the direct
+        pipeline because there's no same-size background reference
+        for un-warped originals.
+        """
+        if seg_method == "ai" and _AI_AVAILABLE:
+            if self._ai_segmenter is None or self._ai_segmenter.model_name != ai_model:
+                self._ai_segmenter = AISegmenter(model_name=ai_model)
+            return self._ai_segmenter.segment(
+                frame_bgr, refine_morph=True,
+                morph_size=morph_size,
+                dilate_iterations=dilate_iterations,
+                erode_iterations=erode_iterations,
+                feather_radius=feather_radius,
+                min_contour_area=min_contour_area,
+            )
+
+        # Without AI in the direct pipeline, use a simple approach:
+        # Center-weighted mask that assumes the subject is near the center.
+        # This is a reasonable default for sports footage (subject tracked
+        # by camera) and avoids the need for a full background reference.
+        h, w = frame_bgr.shape[:2]
+        return np.full((h, w), 255, dtype=np.uint8)
+
+    def generate(self, keyframes: list[np.ndarray],
+                 alignment_method: str = "orb",
+                 seg_method: str = "ai",
+                 ai_model: str = "u2netp",
+                 backdrop_method: str = "median",
+                 threshold: int = 35,
+                 morph_size: int = 5,
+                 dilate_iterations: int = 0,
+                 erode_iterations: int = 0,
+                 feather_radius: int = 3,
+                 min_contour_area: float = 0.001,
+                 opacity: float = 1.0,
+                 shadow: bool = True) -> np.ndarray:
+        """Generate the stop-motion composite from keyframes.
+
+        Pipeline:
+          1. Align keyframes to each other (only N frames, not all video)
+          2. Compute canvas bounds
+          3. Build lightweight backdrop from keyframes
+          4. Segment each keyframe on the ORIGINAL frame (no warp artifacts)
+          5. Warp frame + mask to canvas, composite
+
+        Returns the final composite image (BGR).
+        """
+        self.alignment_method = alignment_method
+        self.seg_method = seg_method
+
+        if len(keyframes) == 0:
+            return np.zeros((100, 100, 3), dtype=np.uint8)
+
+        if len(keyframes) == 1:
+            # Single frame — just segment and return
+            mask = self._segment_frame(
+                keyframes[0], seg_method, ai_model,
+                morph_size=morph_size,
+                dilate_iterations=dilate_iterations,
+                erode_iterations=erode_iterations,
+                feather_radius=feather_radius,
+                min_contour_area=min_contour_area,
+                threshold=threshold,
+            )
+            result = keyframes[0].copy()
+            alpha = mask.astype(np.float64) / 255.0
+            alpha_3 = np.stack([alpha] * 3, axis=-1)
+            bg = np.full_like(result, 128, dtype=np.uint8)
+            return (bg * (1 - alpha_3) + result * alpha_3).astype(np.uint8)
+
+        # Step 1: Align only the keyframes
+        homographies = self._align_keyframes(keyframes, method=alignment_method)
+
+        # Step 2: Canvas from keyframe positions
+        self.canvas_w, self.canvas_h, offset_H = self._compute_canvas(
+            keyframes, homographies)
+
+        # Step 3: Lightweight backdrop from keyframes
+        backdrop = self._build_backdrop(
+            keyframes, homographies, offset_H,
+            self.canvas_w, self.canvas_h, method=backdrop_method)
+
+        # Step 4 & 5: Segment on originals, warp to canvas, composite
+        result = backdrop.copy().astype(np.float64)
+
+        for i, kf in enumerate(keyframes):
+            # Segment on the ORIGINAL un-warped frame (better quality)
+            mask_orig = self._segment_frame(
+                kf, seg_method, ai_model,
+                morph_size=morph_size,
+                dilate_iterations=dilate_iterations,
+                erode_iterations=erode_iterations,
+                feather_radius=0,  # feather after warping
+                min_contour_area=min_contour_area,
+                threshold=threshold,
+            )
+
+            # Warp both frame and mask to canvas coordinates
+            H_total = offset_H @ homographies[i]
+            warped_frame = cv2.warpPerspective(
+                kf, H_total, (self.canvas_w, self.canvas_h))
+            warped_mask = cv2.warpPerspective(
+                mask_orig, H_total, (self.canvas_w, self.canvas_h),
+                flags=cv2.INTER_LINEAR)
+
+            # Re-threshold (warp interpolation blurs the mask)
+            _, warped_mask = cv2.threshold(warped_mask, 127, 255, cv2.THRESH_BINARY)
+
+            # Clip to valid warp region
+            wg = cv2.cvtColor(warped_frame, cv2.COLOR_BGR2GRAY)
+            valid = (wg > 2).astype(np.uint8) * 255
+            ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            valid = cv2.erode(valid, ek, iterations=2)
+            warped_mask = cv2.bitwise_and(warped_mask, valid)
+
+            # Feather after warping for smooth edges
+            if feather_radius > 0:
+                k = feather_radius * 2 + 1
+                warped_mask = cv2.GaussianBlur(warped_mask, (k, k), 0)
+
+            # Composite
+            alpha = (warped_mask.astype(np.float64) / 255.0) * opacity
+
+            if shadow:
+                shadow_mask = cv2.GaussianBlur(warped_mask, (21, 21), 10)
+                shadow_alpha = (shadow_mask.astype(np.float64) / 255.0) * 0.15
+                for c in range(3):
+                    result[:, :, c] = result[:, :, c] * (1 - shadow_alpha)
+
+            alpha_3 = np.stack([alpha] * 3, axis=-1)
+            result = result * (1 - alpha_3) + warped_frame.astype(np.float64) * alpha_3
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def generate_opacity_blend(self, keyframes: list[np.ndarray],
+                               alignment_method: str = "orb",
+                               opacity: float = 0.7) -> np.ndarray:
+        """Generate a multi-exposure blend — NO segmentation at all.
+
+        Simply aligns keyframes and layers them with decreasing opacity.
+        Fast, simple, gives a natural multiple-exposure / chronophotography look.
+
+        Returns the final composite image (BGR).
+        """
+        self.alignment_method = alignment_method
+        self.seg_method = "opacity_blend"
+
+        if len(keyframes) <= 1:
+            return keyframes[0].copy() if keyframes else np.zeros((100, 100, 3), dtype=np.uint8)
+
+        homographies = self._align_keyframes(keyframes, method=alignment_method)
+        self.canvas_w, self.canvas_h, offset_H = self._compute_canvas(
+            keyframes, homographies)
+
+        # Start with the middle frame as base (most stable alignment)
+        mid = len(keyframes) // 2
+        H_mid = offset_H @ homographies[mid]
+        result = cv2.warpPerspective(
+            keyframes[mid], H_mid, (self.canvas_w, self.canvas_h)
+        ).astype(np.float64)
+
+        # Layer all other frames with opacity
+        per_frame_opacity = opacity / len(keyframes)
+        for i, kf in enumerate(keyframes):
+            if i == mid:
+                continue
+            H_total = offset_H @ homographies[i]
+            warped = cv2.warpPerspective(kf, H_total, (self.canvas_w, self.canvas_h))
+            # Only blend where the warped frame has content
+            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+            mask = (gray > 2).astype(np.float64) * per_frame_opacity
+            mask_3 = np.stack([mask] * 3, axis=-1)
+            result = result * (1 - mask_3) + warped.astype(np.float64) * mask_3
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+
 class PanoramicPipeline:
     """End-to-end pipeline for moving camera stop-motion generation.
 

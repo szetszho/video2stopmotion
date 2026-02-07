@@ -34,6 +34,65 @@ except ImportError:
     pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Frame preprocessing — improves stitching & segmentation quality
+# ═══════════════════════════════════════════════════════════════════════════
+
+def preprocess_frame(frame_bgr: np.ndarray,
+                     denoise: bool = True,
+                     clahe: bool = True) -> np.ndarray:
+    """Preprocess a frame for better stitching and segmentation.
+
+    1. Denoise — bilateral filter removes compression artifacts and sensor
+       noise while preserving edges.  This is the main fix for spotty
+       segmentation caused by JPEG/H.264 block artifacts.
+    2. CLAHE — contrast-limited adaptive histogram equalization normalizes
+       local brightness.  Helps feature matching on low-contrast footage
+       and reduces false positives from uneven exposure.
+
+    Returns the preprocessed frame (BGR, same size).
+    """
+    out = frame_bgr
+    if denoise:
+        # Bilateral filter: strong denoising (d=7, sigma=60) but keeps edges
+        out = cv2.bilateralFilter(out, d=7, sigmaColor=60, sigmaSpace=60)
+    if clahe:
+        # Apply CLAHE per-channel in LAB space (only on L channel)
+        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = cl.apply(l)
+        lab = cv2.merge([l, a, b])
+        out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return out
+
+
+def preprocess_for_alignment(gray: np.ndarray) -> np.ndarray:
+    """Enhance a grayscale frame for better feature detection.
+
+    Applies CLAHE to boost local contrast — makes ORB find more features
+    on flat or low-contrast backgrounds (snow, water, walls).
+    """
+    cl = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return cl.apply(gray)
+
+
+def normalize_exposure(frame_bgr: np.ndarray,
+                       ref_mean: np.ndarray) -> np.ndarray:
+    """Normalize a frame's brightness to match a reference.
+
+    Shifts per-channel mean to match ref_mean.  This reduces false
+    positives in background subtraction caused by auto-exposure
+    or white-balance drift between frames.
+    """
+    frame_f = frame_bgr.astype(np.float32)
+    cur_mean = frame_f.mean(axis=(0, 1))
+    # Avoid division by zero
+    scale = np.where(cur_mean > 1.0, ref_mean / cur_mean, 1.0)
+    frame_f *= scale[np.newaxis, np.newaxis, :]
+    return np.clip(frame_f, 0, 255).astype(np.uint8)
+
+
 class VideoProcessor:
     """Loads a video and extracts frames from a specified time range."""
 
@@ -142,9 +201,15 @@ def segment_foreground(frame: np.ndarray, background: np.ndarray,
         feather_radius:   Gaussian blur radius applied to the final mask
                           (0 = hard edge, higher = softer blend).
     """
-    diff = cv2.absdiff(frame, background)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray_diff, (5, 5), 0)
+    # Preprocess: denoise + exposure-normalize for cleaner diff
+    bg_mean = background.astype(np.float32).mean(axis=(0, 1))
+    frame_pp = preprocess_frame(frame, denoise=True, clahe=False)
+    frame_pp = normalize_exposure(frame_pp, bg_mean)
+    bg_pp = preprocess_frame(background, denoise=True, clahe=False)
+
+    diff = cv2.absdiff(frame_pp, bg_pp)
+    gray_diff = diff.max(axis=2)  # max across channels (catches colour diffs)
+    blurred = cv2.GaussianBlur(gray_diff, (7, 7), 0)
     _, mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_size, morph_size))
@@ -281,7 +346,8 @@ def compute_direct_homographies(frames: list[np.ndarray],
     cumulative = [None] * n
     cumulative[ref_index] = np.eye(3, dtype=np.float64)
 
-    ref_gray = cv2.cvtColor(frames[ref_index], cv2.COLOR_BGR2GRAY)
+    ref_gray = preprocess_for_alignment(
+        cv2.cvtColor(frames[ref_index], cv2.COLOR_BGR2GRAY))
 
     def match_to_ref(frame_gray):
         pts_ref, pts_frame = _detect_and_match(ref_gray, frame_gray,
@@ -297,7 +363,7 @@ def compute_direct_homographies(frames: list[np.ndarray],
     for i in range(n):
         if i == ref_index:
             continue
-        g = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+        g = preprocess_for_alignment(cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY))
         H = match_to_ref(g)
         if H is not None:
             cumulative[i] = H
@@ -313,8 +379,10 @@ def compute_direct_homographies(frames: list[np.ndarray],
             for delta in [1, -1, 2, -2, 3, -3]:
                 ni = i + delta
                 if 0 <= ni < n and cumulative[ni] is not None:
-                    g_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
-                    g_ni = cv2.cvtColor(frames[ni], cv2.COLOR_BGR2GRAY)
+                    g_i = preprocess_for_alignment(
+                        cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY))
+                    g_ni = preprocess_for_alignment(
+                        cv2.cvtColor(frames[ni], cv2.COLOR_BGR2GRAY))
                     pts_ni, pts_i = _detect_and_match(g_ni, g_i,
                                                       max_features=max_features)
                     if pts_ni is not None:
@@ -440,6 +508,17 @@ def build_panoramic_background(frames: list[np.ndarray],
     else:
         indices = list(range(len(frames)))
 
+    # Preprocess backdrop frames: denoise + exposure-normalize to the
+    # reference frame.  This gives a cleaner median (fewer compression
+    # artefacts) and reduces exposure drift that causes spotty segmentation.
+    ref_idx = indices[len(indices) // 2]
+    ref_pp = preprocess_frame(frames[ref_idx], denoise=True, clahe=False)
+    ref_mean = ref_pp.astype(np.float32).mean(axis=(0, 1))
+
+    def _prep(i: int) -> np.ndarray:
+        pp = preprocess_frame(frames[i], denoise=True, clahe=False)
+        return normalize_exposure(pp, ref_mean)
+
     if method == "median" and len(indices) >= 3:
         # Median blending: stack warped frames and take per-pixel median.
         # NaN-masked so only pixels with actual coverage contribute.
@@ -447,7 +526,7 @@ def build_panoramic_background(frames: list[np.ndarray],
         mask_stack = []
         for i in indices:
             H_total = offset_H @ cumulative_H[i]
-            warped = cv2.warpPerspective(frames[i], H_total,
+            warped = cv2.warpPerspective(_prep(i), H_total,
                                          (canvas_w, canvas_h))
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             valid = (gray > 0).astype(np.uint8)
@@ -470,7 +549,7 @@ def build_panoramic_background(frames: list[np.ndarray],
         panorama = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         for i in indices:
             H_total = offset_H @ cumulative_H[i]
-            warped = cv2.warpPerspective(frames[i], H_total,
+            warped = cv2.warpPerspective(_prep(i), H_total,
                                          (canvas_w, canvas_h))
             mask = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) > 0
             panorama[mask] = warped[mask]
@@ -496,7 +575,19 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
     See segment_foreground() for parameter descriptions — they behave
     identically here but operate on the warped panoramic canvas.
     """
-    warped = cv2.warpPerspective(frame, H_to_panorama, (canvas_w, canvas_h))
+    # Preprocess the frame: denoise + exposure-normalize to match the
+    # panorama.  This is the key fix for spotty segmentation — without it,
+    # compression artifacts and slight exposure drift create thousands of
+    # small false-positive pixels in the absdiff.
+    pano_mean = panorama.astype(np.float32).mean(axis=(0, 1))
+    # Only normalize on non-zero panorama pixels
+    pano_nz = panorama[panorama.sum(axis=-1) > 10]
+    if len(pano_nz) > 0:
+        pano_mean = pano_nz.astype(np.float32).mean(axis=0)
+    frame_pp = preprocess_frame(frame, denoise=True, clahe=False)
+    frame_pp = normalize_exposure(frame_pp, pano_mean)
+
+    warped = cv2.warpPerspective(frame_pp, H_to_panorama, (canvas_w, canvas_h))
 
     # Valid region mask (where the warped frame has content)
     warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
@@ -506,10 +597,13 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
     erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     valid_mask = cv2.erode(valid_mask, erode_k, iterations=2)
 
-    # Difference against panoramic background
+    # Difference against panoramic background — use max across channels
+    # instead of grayscale mean.  This catches coloured differences that
+    # average out in grayscale (e.g. red jersey on green grass).
     diff = cv2.absdiff(warped, panorama)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray_diff, (7, 7), 0)
+    # Take per-pixel max across B, G, R channels
+    gray_diff = diff.max(axis=2)
+    blurred = cv2.GaussianBlur(gray_diff, (9, 9), 0)
 
     _, fg_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
     fg_mask = cv2.bitwise_and(fg_mask, valid_mask)
@@ -527,15 +621,28 @@ def segment_foreground_moving(frame: np.ndarray, panorama: np.ndarray,
         ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         fg_mask = cv2.erode(fg_mask, ek, iterations=erode_iterations)
 
-    # Keep only large contours
+    # Keep only large contours and fill interior holes
     total_area = canvas_h * canvas_w
     min_area = min_contour_area * total_area
-    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(
+        fg_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     clean_mask = np.zeros_like(fg_mask)
-    for cnt in contours:
-        if cv2.contourArea(cnt) >= min_area:
-            cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+    if hierarchy is not None:
+        for i, cnt in enumerate(contours):
+            # Only draw outer contours (parent == -1 means top-level)
+            if hierarchy[0][i][3] == -1 and cv2.contourArea(cnt) >= min_area:
+                # Fill the contour including all its holes
+                cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+    else:
+        for cnt in contours:
+            if cv2.contourArea(cnt) >= min_area:
+                cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+
+    # Fill any remaining small holes inside the subject with a second
+    # close pass at a larger kernel
+    fill_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (morph_size * 2 + 1, morph_size * 2 + 1))
+    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, fill_k, iterations=1)
 
     # Edge feathering
     if feather_radius > 0:

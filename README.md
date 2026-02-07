@@ -1,28 +1,48 @@
-# Video → Stop-Motion Effect | Sports Analysis Tool
+# Video → Stop-Motion Composite | Sports Analysis Tool
 
 Transform video clips into stop-motion composite images that show a subject's full movement trajectory in a single frame — ideal for sports analysis, coaching, and biomechanics study.
 
-**Supports both static and moving cameras** — moving camera footage is automatically aligned and stitched into an expanded panoramic background.
-
-**Optional AI enhancement** — plug in neural-network segmentation (U2-Net, IS-Net, RMBG) and dense optical flow for higher quality on difficult footage.
+Moving camera footage is automatically aligned and stitched into an expanded panoramic background.
 
 ![Example Output](example_output.png)
 
-## How It Works
+## Prerequisites
 
-### Moving Camera (default)
+### FFmpeg
 
-1. **Import a video** of an athlete performing a movement (filmed with a panning/tracking camera)
-2. **Select a time section** — a couple of seconds covering the key action
-3. **Align & stitch** — frames are aligned via ORB features or dense optical flow, then stitched into a wide panoramic background
-4. **Pick keyframes** — automatically (based on movement detection in panorama coordinates) or uniformly spaced
-5. **Generate composite** — the subject is segmented (classical or AI) from each keyframe and composited onto the expanded panoramic canvas
+OpenCV uses FFmpeg under the hood to decode video files. Install it before running the app.
 
-The result is an image **wider than any single video frame**, showing the full trajectory across the scene.
+**macOS:**
+```bash
+brew install ffmpeg
+```
 
-### Static Camera
+**Ubuntu / Debian:**
+```bash
+sudo apt update && sudo apt install ffmpeg
+```
 
-For tripod/fixed camera footage, uses pixel-wise median to estimate a clean background, then segments and composites the subject at each keyframe.
+**Windows:**
+```
+# Option 1: Chocolatey
+choco install ffmpeg
+
+# Option 2: Scoop
+scoop install ffmpeg
+
+# Option 3: Manual
+# Download from https://www.gyan.dev/ffmpeg/builds/
+# Extract and add the bin/ folder to your system PATH
+```
+
+**Verify installation:**
+```bash
+ffmpeg -version
+```
+
+### Python
+
+Python 3.10 or newer is required.
 
 ## Installation
 
@@ -31,148 +51,100 @@ For tripod/fixed camera footage, uses pixel-wise median to estimate a clean back
 git clone https://github.com/szetszho/video2stopmotion.git
 cd video2stopmotion
 
-# Install core dependencies
+# Install Python dependencies
 pip install -r requirements.txt
-
-# (Optional) Install AI acceleration — pick ONE:
-pip install onnxruntime-gpu>=1.17.0 huggingface-hub   # NVIDIA GPU
-pip install onnxruntime>=1.17.0 huggingface-hub        # CPU / Apple Silicon
 ```
 
-### Dependencies
+### Optional: AI-enhanced segmentation
 
-**Core (required):**
-- Python 3.10+
-- OpenCV (`opencv-python`)
-- NumPy
-- Pillow
-- Gradio (for the web UI)
-- scikit-image
+For higher quality subject extraction using neural networks:
 
-**AI features (optional):**
-- `onnxruntime-gpu` (NVIDIA) or `onnxruntime` (CPU/Apple)
-- `huggingface-hub` (for automatic model download)
+```bash
+# NVIDIA GPU (Windows / Linux)
+pip install onnxruntime-gpu huggingface-hub
+
+# Apple Silicon (macOS) or CPU-only
+pip install onnxruntime huggingface-hub
+```
 
 ## Usage
-
-### Launch the Web UI
 
 ```bash
 python app.py
 ```
 
-Then open `http://localhost:7860` in your browser.
+Open `http://localhost:7860` in your browser.
 
-### Workflow
+### 3-Step Workflow
 
-| Step | Action |
-|------|--------|
-| 1 | Choose camera mode (Moving or Static) |
-| 2 | Upload a video file (MP4, AVI, MOV, etc.) |
-| 3 | Set start/end times to select the action section |
-| 4 | *(Moving Camera)* Click "Align & Build Panorama" to stitch the background |
-| 5 | Choose keyframes (auto or uniform) and preview |
-| 6 | Choose segmentation method (Classical or AI) and adjust parameters |
-| 7 | Generate the composite, preview, and download |
+| Step | What to do |
+|------|------------|
+| **1. Upload** | Load a video (MP4, AVI, MOV). 1080p recommended. |
+| **2. Trim** | Set start/end to isolate the action (1–5 seconds). |
+| **3. Generate** | Pick the number of poses and click **Generate Composite**. |
 
-### Parameters
+The app automatically aligns frames, builds a panoramic background, selects keyframes, segments the subject, and composites everything.
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| **Camera Mode** | `Moving Camera` (panoramic stitching) or `Static Camera` (median bg) | Moving |
-| **Alignment Method** | `ORB` (fast, feature-based) or `Flow` (dense optical flow, robust on textureless bg) | ORB |
-| **Segmentation Method** | `Classical` (background subtraction) or `AI Model` (neural network) | Classical |
-| **AI Model** | `u2netp` (fast), `u2net` (quality), `isnet-general` (people), `rmbg-1.4` (production) | u2netp |
-| **Number of Keyframes** | How many subject poses to include (3–15) | 7 |
-| **Selection Mode** | `Auto` (movement-based) or `Uniform` spacing | Auto |
-| **Detection Sensitivity** | Higher = detects subtler movements | 30 |
-| **Background Method** | `median` (removes subject) or `overlay` (faster) | median |
-| **Backdrop Density** | Frames used for panorama (3–30). Lower = faster | 12 |
-| **Segmentation Threshold** | Lower = more sensitive foreground detection (classical only) | 35 |
-| **Morph Kernel Size** | Cleanup kernel for mask edges | 7 |
-| **Dilate / Erode** | Grow or shrink the segmentation mask | 0 |
-| **Edge Feathering** | Soft blend radius for cut-out edges | 3 |
-| **Min Object Size** | Discard blobs smaller than this % of image | 0.1% |
-| **Subject Opacity** | Transparency of each subject layer | 1.0 |
-| **Drop Shadow** | Adds shadow behind each subject | On |
+### Advanced Settings
+
+Click the **Advanced Settings** accordion to fine-tune:
+
+| Setting | What it does | Default |
+|---------|-------------|---------|
+| **Alignment** | `ORB` (fast) or `Flow` (better on snow/water/sky) | ORB |
+| **Backdrop Frames** | How many frames build the panorama (lower = faster) | 12 |
+| **Segmentation** | `Classical` (background subtraction) or `AI Model` | Classical |
+| **AI Model** | `u2netp` (fast, 5 MB) / `isnet-general` (people, 176 MB) / `rmbg-1.4` (best, 176 MB) | u2netp |
+| **Threshold** | Lower = more sensitive foreground detection | 35 |
+| **Dilate / Erode** | Grow or shrink the subject mask | 0 |
+| **Edge Feather** | Soft blend on cut-out edges | 3 |
+| **Opacity** | Subject transparency (lower = see-through) | 1.0 |
+| **Drop Shadow** | Adds depth behind each subject | On |
+
+## Image Preprocessing
+
+Frames are automatically preprocessed before stitching and segmentation:
+
+- **Bilateral denoising** — removes H.264/JPEG compression block artifacts that cause spotty masks
+- **Exposure normalization** — compensates for auto-exposure drift between frames
+- **CLAHE contrast enhancement** — boosts feature detection on low-contrast backgrounds (snow, walls, sky)
+- **Max-channel diff** — catches colour differences that average out in grayscale (e.g. red jersey on green grass)
 
 ## AI Models
 
-When `onnxruntime` is installed, the app auto-detects GPU support and offers AI-powered features:
-
-### AI Segmentation
-
-Uses pre-trained neural networks for single-image background removal — no reference background needed. Produces much cleaner alpha mattes than classical background subtraction, especially for:
-- Hair, equipment, and fine details
-- Subjects with similar colors to the background
-- Complex poses and overlapping limbs
-
-| Model | Size | Speed | Best For |
-|-------|------|-------|----------|
-| **u2netp** | 4.7 MB | Fast | Quick previews, lightweight usage |
-| **u2net** | 176 MB | Medium | General purpose, good quality |
-| **isnet-general** | 176 MB | Medium | People and athletes |
-| **rmbg-1.4** | 176 MB | Medium | Production quality output |
-
-Models are downloaded automatically on first use and cached in `~/.cache/video2stopmotion/models/`.
-
-### Dense Optical Flow Alignment
-
-Uses OpenCV's DIS optical flow for dense frame-to-frame correspondence — more robust than ORB features on:
-- Uniform/textureless backgrounds (snow, water, sky)
-- Scenes with few distinct features
-- Very smooth camera pans
-
-### GPU Acceleration
-
-The app automatically selects the best available execution provider:
+When `onnxruntime` is installed, the app auto-detects GPU support:
 
 | Platform | Provider | Performance |
 |----------|----------|-------------|
 | NVIDIA GPU | TensorRT → CUDA | Fastest |
-| Apple Silicon | CoreML | Fast (Neural Engine) |
-| CPU | CPU | Slower but always works |
+| Apple Silicon | CoreML (Neural Engine) | Fast |
+| CPU | CPU fallback | Slower but always works |
 
-## Tips for Best Results
+AI segmentation models are downloaded automatically on first use (~5–176 MB) and cached in `~/.cache/video2stopmotion/models/`.
 
-- **Moving camera**: Ensure there's enough texture in the background for feature matching (buildings, trees, terrain). If the background is uniform (snow, sky), switch to **Flow** alignment.
-- **AI segmentation**: Try `u2netp` first for speed, switch to `isnet-general` or `rmbg-1.4` if the mask quality isn't good enough.
-- Keep the **subject moving** across the frame (not just in place)
-- A section of **1–3 seconds** usually works best
-- Higher contrast between subject and background gives better segmentation
-- Adjust the segmentation threshold if the subject isn't cleanly extracted
-- For **very long pans**, the affine alignment keeps the panorama geometrically stable
+## Tips
+
+- **1080p** is the sweet spot — enough detail, fast processing
+- **1–3 second** clips work best; 5 seconds is fine but slower
+- If the background is uniform (snow, sky), switch alignment to **Flow** in Advanced Settings
+- If segmentation looks spotty, try lowering the **Threshold** to 20–25
+- Use **Dilate** +1–2 to recover clipped edges (hair, equipment)
+- Use **Erode** +1–2 to remove background halo around the subject
 
 ## Architecture
 
 ```
 video2stopmotion/
-├── app.py                # Gradio web UI (both camera modes)
-├── video_processor.py    # Core processing engine
-├── ai_models.py          # AI model backends (ONNX Runtime)
+├── app.py                # Gradio web UI (3-step workflow)
+├── video_processor.py    # Core processing engine (pure OpenCV/NumPy)
+├── ai_models.py          # AI model backends (ONNX Runtime, optional)
 ├── generate_example.py   # Generates synthetic example images
 ├── requirements.txt      # Python dependencies
-├── example_output.png    # Example panoramic composite
+├── example_output.png    # Example composite
 └── README.md
 ```
 
-### Core Modules
-
-**`video_processor.py`** — Processing engine:
-- `VideoProcessor` — Video loading, frame extraction, metadata
-- `PanoramicPipeline` — End-to-end moving camera workflow (align → stitch → segment → composite)
-- `compute_direct_homographies()` — ORB-based affine alignment (avoids chain drift)
-- `compute_direct_homographies_flow()` — Dense optical flow alignment
-- `segment_foreground()` — Classical background subtraction (static camera)
-- `segment_foreground_ai()` — AI neural network segmentation
-- `segment_foreground_moving()` — Panoramic background subtraction (moving camera)
-- `build_panoramic_background()` — Stitch aligned frames into expanded panorama
-- `composite_stop_motion()` — Layer subjects onto clean background with drop shadows
-
-**`ai_models.py`** — AI backends:
-- `AISegmenter` — ONNX-based foreground segmentation (U2-Net, IS-Net, RMBG)
-- `OpticalFlowAligner` — Dense optical flow frame alignment
-- `check_ai_status()` — Detect available GPU providers and models
+The core engine (`video_processor.py`) has zero UI dependencies — it's pure OpenCV + NumPy, designed to be wrapped in any frontend (Gradio, native app, CLI).
 
 ## License
 

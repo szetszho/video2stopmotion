@@ -695,11 +695,7 @@ def auto_select_keyframes_moving(frames: list[tuple[int, np.ndarray]],
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# High-level pipeline for moving camera
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════
-# High-level pipeline for moving camera
+# High-level pipelines for moving camera
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DirectCompositePipeline:

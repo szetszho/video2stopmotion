@@ -22,11 +22,25 @@ from video_processor import (
     VideoProcessor,
     estimate_background,
     segment_foreground,
+    segment_foreground_ai,
     composite_stop_motion,
     auto_select_keyframes,
     auto_select_keyframes_moving,
     PanoramicPipeline,
+    _AI_AVAILABLE,
 )
+
+# AI status detection
+_ai_status = {"available": False, "providers": [], "models": []}
+try:
+    from ai_models import check_ai_status
+    _ai_status_full = check_ai_status()
+    _ai_status["available"] = _ai_status_full.get("onnxruntime_installed", False)
+    _ai_status["providers"] = _ai_status_full.get("providers", [])
+    _ai_status["models"] = _ai_status_full.get("segmentation_models", [])
+    _ai_status["gpu"] = _ai_status_full.get("gpu_available", False)
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # State helpers
@@ -99,14 +113,14 @@ def extract_section(start_time, end_time):
 # Step 3 — Align & stitch panorama
 # ---------------------------------------------------------------------------
 
-def align_and_stitch(bg_method, backdrop_density):
+def align_and_stitch(bg_method, backdrop_density, alignment_method):
     global _panoramic_pipeline
     if not _all_section_frames:
         return None, "Extract a video section first."
 
     frames_bgr = [f for _, f in _all_section_frames]
     _panoramic_pipeline = PanoramicPipeline(frames_bgr)
-    _panoramic_pipeline.align_frames()
+    _panoramic_pipeline.align_frames(alignment_method=alignment_method)
     _panoramic_pipeline.build_panorama(method=bg_method,
                                        backdrop_density=int(backdrop_density))
 
@@ -114,9 +128,11 @@ def align_and_stitch(bg_method, backdrop_density):
     if pano is None:
         return None, "Panorama build failed."
 
+    align_label = "Dense Optical Flow" if alignment_method == "flow" else "ORB Features"
     pano_rgb = _bgr_to_rgb(pano)
     info = (
         f"**Panorama built**\n"
+        f"- Alignment: **{align_label}**\n"
         f"- Canvas size: {_panoramic_pipeline.canvas_w} x {_panoramic_pipeline.canvas_h}\n"
         f"- Frames used for backdrop: **{min(int(backdrop_density), len(frames_bgr))}** "
         f"of {len(frames_bgr)} total\n"
@@ -191,7 +207,8 @@ def pick_keyframes_uniform(num_keyframes):
 
 def generate_composite(
     num_keyframes, selection_mode, sensitivity, camera_mode,
-    bg_method, backdrop_density,
+    bg_method, backdrop_density, alignment_method,
+    seg_method, ai_model,
     seg_threshold, morph_size, dilate_iter, erode_iter, feather_radius,
     min_object_pct, opacity, enable_shadow,
 ):
@@ -200,13 +217,14 @@ def generate_composite(
 
     frames_bgr = [f for _, f in _all_section_frames]
     min_area = float(min_object_pct) / 100.0
+    use_ai_seg = (seg_method == "AI Model") and _AI_AVAILABLE
 
     # ── Moving camera path ────────────────────────────────────────────
     if camera_mode == "Moving Camera":
         global _panoramic_pipeline
         if _panoramic_pipeline is None:
             _panoramic_pipeline = PanoramicPipeline(frames_bgr)
-            _panoramic_pipeline.align_frames()
+            _panoramic_pipeline.align_frames(alignment_method=alignment_method)
             _panoramic_pipeline.build_panorama(
                 method=bg_method,
                 backdrop_density=int(backdrop_density),
@@ -241,12 +259,16 @@ def generate_composite(
             feather_radius=int(feather_radius),
             opacity=opacity,
             shadow=enable_shadow,
+            use_ai=use_ai_seg,
+            ai_model=ai_model,
         )
 
+        seg_label = f"AI ({ai_model})" if use_ai_seg else "Classical (background subtraction)"
         result_rgb = _bgr_to_rgb(result_bgr)
         info = (
             f"**Panoramic composite** with **{len(kf_list_indices)}** subjects.\n"
             f"- Canvas: {pipe.canvas_w} x {pipe.canvas_h}\n"
+            f"- Segmentation: **{seg_label}**\n"
             f"- Backdrop frames used: {min(int(backdrop_density), len(frames_bgr))}"
         )
         return result_rgb, info
@@ -274,15 +296,26 @@ def generate_composite(
     for idx in selected_indices:
         frame = _processor.get_frame(idx)
         if frame is not None:
-            mask = segment_foreground(
-                frame, background,
-                threshold=int(seg_threshold),
-                morph_size=int(morph_size),
-                min_contour_area=min_area,
-                dilate_iterations=int(dilate_iter),
-                erode_iterations=int(erode_iter),
-                feather_radius=int(feather_radius),
-            )
+            if use_ai_seg:
+                mask = segment_foreground_ai(
+                    frame,
+                    model_name=ai_model,
+                    morph_size=int(morph_size),
+                    dilate_iterations=int(dilate_iter),
+                    erode_iterations=int(erode_iter),
+                    feather_radius=int(feather_radius),
+                    min_contour_area=min_area,
+                )
+            else:
+                mask = segment_foreground(
+                    frame, background,
+                    threshold=int(seg_threshold),
+                    morph_size=int(morph_size),
+                    min_contour_area=min_area,
+                    dilate_iterations=int(dilate_iter),
+                    erode_iterations=int(erode_iter),
+                    feather_radius=int(feather_radius),
+                )
             keyframe_bgr.append(frame)
             keyframe_masks.append(mask)
 
@@ -293,8 +326,12 @@ def generate_composite(
         background, keyframe_bgr, keyframe_masks,
         opacity=opacity, shadow=enable_shadow,
     )
+    seg_label = f"AI ({ai_model})" if use_ai_seg else "Classical"
     result_rgb = _bgr_to_rgb(result_bgr)
-    info = f"Composite with **{len(keyframe_bgr)}** subjects on clean background."
+    info = (
+        f"Composite with **{len(keyframe_bgr)}** subjects on clean background.\n"
+        f"- Segmentation: **{seg_label}**"
+    )
     return result_rgb, info
 
 
@@ -361,12 +398,30 @@ CSS = """
 """
 
 with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=gr.themes.Soft()) as demo:
+    # Build AI status message for header
+    _ai_info_parts = []
+    if _ai_status["available"]:
+        gpu_provs = [p for p in _ai_status["providers"] if "CPU" not in p]
+        if gpu_provs:
+            _ai_info_parts.append(f"GPU: {gpu_provs[0]}")
+        else:
+            _ai_info_parts.append("CPU only")
+        _ai_info_parts.append(f"{len(_ai_status['models'])} AI models available")
+        _ai_badge = " | ".join(_ai_info_parts)
+        _ai_header = f"  \n**AI Enhanced** — {_ai_badge}"
+    else:
+        _ai_header = (
+            "  \n*AI models not installed. Install `onnxruntime-gpu` (NVIDIA) or "
+            "`onnxruntime` (CPU/Apple) + `huggingface-hub` for AI segmentation.*"
+        )
+
     gr.Markdown(
         "# Video → Stop-Motion Effect\n"
         "### Sports Analysis Tool — Visualize body movement across time\n"
         "Upload a video, select a section, pick keyframes, and generate a composite image "
         "showing the subject at multiple points in time. **Supports both static and moving cameras** — "
-        "moving camera footage is stitched into an expanded panoramic background.",
+        "moving camera footage is stitched into an expanded panoramic background."
+        + _ai_header,
         elem_classes=["main-title"],
     )
 
@@ -451,6 +506,14 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
                          "Lower = faster & less memory (good for 5+ second clips). "
                          "Higher = smoother backdrop. 8–15 is usually enough.",
                 )
+                alignment_method = gr.Radio(
+                    ["orb", "flow"], value="orb",
+                    label="Alignment Method",
+                    info="ORB: fast feature-based alignment (works well with textured backgrounds). "
+                         "Flow: dense optical flow — more robust on uniform/textureless backgrounds "
+                         "(snow, water, sky) but slightly slower.",
+                    interactive=True,
+                )
             stitch_btn = gr.Button("Align & Build Panorama", variant="primary")
             panorama_info = gr.Markdown("")
             panorama_preview = gr.Image(label="Panoramic Background Preview", interactive=False)
@@ -499,6 +562,30 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
             )
             with gr.Row():
                 with gr.Column(scale=2):
+                    gr.Markdown("### Segmentation Method")
+                    seg_method = gr.Radio(
+                        ["Classical (background subtraction)", "AI Model"],
+                        value="Classical (background subtraction)",
+                        label="Segmentation Method",
+                        info="Classical: uses background subtraction (fast, no downloads). "
+                             "AI Model: uses a neural network for single-image segmentation — "
+                             "produces cleaner masks, especially for hair, equipment, and complex poses. "
+                             "Requires onnxruntime + huggingface-hub.",
+                        interactive=True,
+                    )
+                    ai_model_choices = ["u2netp", "u2net", "isnet-general", "rmbg-1.4"]
+                    ai_model = gr.Dropdown(
+                        choices=ai_model_choices,
+                        value="u2netp",
+                        label="AI Model",
+                        info="u2netp: lightweight (4.7 MB), fast. "
+                             "u2net: full model (176 MB), better quality. "
+                             "isnet-general: IS-Net (176 MB), good for people. "
+                             "rmbg-1.4: RMBG (176 MB), production quality.",
+                        interactive=True,
+                        visible=True,
+                    )
+
                     gr.Markdown("### Segmentation Controls")
                     gr.Markdown(
                         "These controls determine how the subject is separated from the background. "
@@ -585,7 +672,7 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
 
     stitch_btn.click(
         fn=align_and_stitch,
-        inputs=[bg_method, backdrop_density],
+        inputs=[bg_method, backdrop_density, alignment_method],
         outputs=[panorama_preview, panorama_info],
     )
 
@@ -604,7 +691,8 @@ with gr.Blocks(title="Video → Stop-Motion | Sports Analysis", css=CSS, theme=g
         fn=generate_composite,
         inputs=[
             num_keyframes, selection_mode, sensitivity, camera_mode,
-            bg_method, backdrop_density,
+            bg_method, backdrop_density, alignment_method,
+            seg_method, ai_model,
             seg_threshold, morph_size, dilate_iter, erode_iter, feather_radius,
             min_object_pct, opacity, enable_shadow,
         ],

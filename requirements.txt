@@ -3,3 +3,15 @@ numpy>=1.24.0
 Pillow>=10.0.0
 gradio>=4.0.0
 scikit-image>=0.21.0
+
+# Optional: AI-enhanced segmentation & alignment (GPU-accelerated)
+# Uncomment the appropriate line for your platform:
+#
+# NVIDIA GPU (Windows/Linux):
+# onnxruntime-gpu>=1.17.0
+#
+# Apple Silicon (macOS) or CPU-only:
+# onnxruntime>=1.17.0
+#
+# Model download from HuggingFace:
+# huggingface-hub>=0.20.0

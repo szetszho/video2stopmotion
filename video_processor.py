@@ -6,6 +6,11 @@ Supports both static and moving camera workflows:
   - Moving camera: homography-based frame alignment, panoramic background
     stitching, and foreground extraction on the expanded canvas
 
+AI-enhanced mode (optional):
+  - AI segmentation via ONNX Runtime (U2-Net, IS-Net, RMBG)
+  - Dense optical flow alignment (OpenCV DIS)
+  When onnxruntime is not installed, falls back to classical methods.
+
 Handles video loading, frame extraction, background estimation,
 foreground segmentation, and composite image creation.
 """
@@ -13,6 +18,20 @@ foreground segmentation, and composite image creation.
 import cv2
 import numpy as np
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Try to import AI models — graceful fallback if unavailable
+_AI_AVAILABLE = False
+_ai_segmenter = None
+_ai_flow_aligner = None
+
+try:
+    from ai_models import AISegmenter, OpticalFlowAligner, check_ai_status
+    _AI_AVAILABLE = True
+except ImportError:
+    pass
 
 
 class VideoProcessor:
@@ -157,6 +176,43 @@ def segment_foreground(frame: np.ndarray, background: np.ndarray,
     return filled_mask
 
 
+def segment_foreground_ai(frame_bgr: np.ndarray,
+                          model_name: str = "u2netp",
+                          morph_size: int = 5,
+                          dilate_iterations: int = 0,
+                          erode_iterations: int = 0,
+                          feather_radius: int = 3,
+                          min_contour_area: float = 0.001) -> np.ndarray:
+    """Segment the foreground using an AI model (no background needed).
+
+    Uses a pre-trained neural network for single-image background removal.
+    Falls back to raising RuntimeError if AI models are not available.
+
+    Args:
+        frame_bgr: Input frame in BGR.
+        model_name: AI model to use ('u2netp', 'u2net', 'isnet-general', 'rmbg-1.4')
+        (other args same as segment_foreground)
+
+    Returns an alpha mask (0-255) where 255 = foreground.
+    """
+    global _ai_segmenter
+    if not _AI_AVAILABLE:
+        raise RuntimeError("AI models not available. Install onnxruntime.")
+
+    if _ai_segmenter is None or _ai_segmenter.model_name != model_name:
+        _ai_segmenter = AISegmenter(model_name=model_name)
+
+    return _ai_segmenter.segment(
+        frame_bgr,
+        refine_morph=True,
+        morph_size=morph_size,
+        dilate_iterations=dilate_iterations,
+        erode_iterations=erode_iterations,
+        feather_radius=feather_radius,
+        min_contour_area=min_contour_area,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Moving camera — Homography & Panoramic Stitching
 # ═══════════════════════════════════════════════════════════════════════════
@@ -280,6 +336,25 @@ def compute_direct_homographies(frames: list[np.ndarray],
             cumulative[i] = np.eye(3, dtype=np.float64)
 
     return cumulative
+
+
+def compute_direct_homographies_flow(frames: list[np.ndarray],
+                                     ref_index: int) -> list[np.ndarray]:
+    """Compute frame-to-reference alignment using dense optical flow.
+
+    Uses OpenCV DIS optical flow for dense correspondences — more robust
+    than ORB on textureless backgrounds (snow, water, sky).
+
+    Returns cumulative_H[i]: maps frame i → reference frame.
+    """
+    if not _AI_AVAILABLE:
+        raise RuntimeError("AI models not available for flow alignment.")
+
+    global _ai_flow_aligner
+    if _ai_flow_aligner is None:
+        _ai_flow_aligner = OpticalFlowAligner()
+
+    return _ai_flow_aligner.align_frames(frames, ref_index=ref_index)
 
 
 def compute_panorama_bounds(frames: list[np.ndarray],
@@ -626,6 +701,10 @@ def auto_select_keyframes_moving(frames: list[tuple[int, np.ndarray]],
 class PanoramicPipeline:
     """End-to-end pipeline for moving camera stop-motion generation.
 
+    Supports both classical (ORB) and AI-enhanced modes:
+      - Classical: ORB features + affine transforms + background subtraction
+      - AI-enhanced: Dense optical flow + neural network segmentation
+
     Usage:
         pipe = PanoramicPipeline(frames_bgr)
         pipe.align_frames()
@@ -641,23 +720,36 @@ class PanoramicPipeline:
         self.panorama: Optional[np.ndarray] = None
         self.canvas_w: int = 0
         self.canvas_h: int = 0
+        self._ai_segmenter: Optional[object] = None
 
     def align_frames(self, ref_index: Optional[int] = None,
-                     max_features: int = 3000, use_affine: bool = True):
+                     max_features: int = 3000, use_affine: bool = True,
+                     alignment_method: str = "orb"):
         """Compute transforms to align all frames to a reference frame.
         By default, the middle frame is used as reference for stability.
 
         Args:
             use_affine: Use affine (translation+rotation+scale) instead of
                         full homography. Better for panning/tracking cameras.
+            alignment_method: 'orb' (classical) or 'flow' (dense optical flow).
+                'flow' is more robust on textureless scenes but slightly slower.
         """
         if ref_index is None:
             ref_index = len(self.frames) // 2
 
-        self.cumulative_H = compute_direct_homographies(
-            self.frames, ref_index=ref_index,
-            max_features=max_features, use_affine=use_affine,
-        )
+        if alignment_method == "flow" and _AI_AVAILABLE:
+            logger.info("Using dense optical flow for frame alignment")
+            self.cumulative_H = compute_direct_homographies_flow(
+                self.frames, ref_index=ref_index,
+            )
+        else:
+            if alignment_method == "flow":
+                logger.warning("Flow alignment requested but AI not available, "
+                             "falling back to ORB")
+            self.cumulative_H = compute_direct_homographies(
+                self.frames, ref_index=ref_index,
+                max_features=max_features, use_affine=use_affine,
+            )
 
     def build_panorama(self, method: str = "median",
                        backdrop_density: int = 12):
@@ -681,13 +773,37 @@ class PanoramicPipeline:
                          threshold: int = 35, morph_size: int = 7,
                          dilate_iterations: int = 0,
                          erode_iterations: int = 0,
-                         feather_radius: int = 3) -> tuple:
+                         feather_radius: int = 3,
+                         use_ai: bool = False,
+                         ai_model: str = "u2netp") -> tuple:
         """Segment the subject from a keyframe in panorama coords.
-        Returns (warped_frame, mask) on the panoramic canvas."""
+        Returns (warped_frame, mask) on the panoramic canvas.
+
+        Args:
+            use_ai: Use AI segmentation instead of background subtraction.
+                Produces cleaner masks without needing the panorama background.
+            ai_model: Which AI model to use (see AISegmenter).
+        """
         if frame_list_index >= len(self.cumulative_H):
             frame_list_index = len(self.cumulative_H) - 1
 
         H_total = self.offset_H @ self.cumulative_H[frame_list_index]
+
+        if use_ai and _AI_AVAILABLE:
+            # AI segmentation: segment on original frame, then warp to panorama
+            if self._ai_segmenter is None or self._ai_segmenter.model_name != ai_model:
+                self._ai_segmenter = AISegmenter(model_name=ai_model)
+
+            return self._ai_segmenter.segment_on_panorama(
+                self.frames[frame_list_index],
+                H_total, self.canvas_w, self.canvas_h,
+                morph_size=morph_size,
+                dilate_iterations=dilate_iterations,
+                erode_iterations=erode_iterations,
+                feather_radius=feather_radius,
+            )
+
+        # Classical: background subtraction on panoramic canvas
         return segment_foreground_moving(
             self.frames[frame_list_index], self.panorama,
             H_total, self.canvas_w, self.canvas_h,
@@ -702,8 +818,15 @@ class PanoramicPipeline:
                  dilate_iterations: int = 0,
                  erode_iterations: int = 0,
                  feather_radius: int = 3,
-                 opacity: float = 1.0, shadow: bool = True) -> np.ndarray:
-        """Generate the final panoramic stop-motion composite."""
+                 opacity: float = 1.0, shadow: bool = True,
+                 use_ai: bool = False,
+                 ai_model: str = "u2netp") -> np.ndarray:
+        """Generate the final panoramic stop-motion composite.
+
+        Args:
+            use_ai: Use AI segmentation for cleaner subject extraction.
+            ai_model: AI model name (see AISegmenter for options).
+        """
         warped_frames = []
         masks = []
 
@@ -713,6 +836,8 @@ class PanoramicPipeline:
                 dilate_iterations=dilate_iterations,
                 erode_iterations=erode_iterations,
                 feather_radius=feather_radius,
+                use_ai=use_ai,
+                ai_model=ai_model,
             )
             warped_frames.append(warped)
             masks.append(mask)

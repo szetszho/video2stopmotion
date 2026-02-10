@@ -1254,16 +1254,20 @@ class PanoramicPipeline:
                  feather_radius: int = 3,
                  opacity: float = 1.0, shadow: bool = True,
                  use_ai: bool = False,
-                 ai_model: str = "u2netp") -> np.ndarray:
+                 ai_model: str = "u2netp",
+                 spacing: float = 1.0) -> np.ndarray:
         """Generate the final panoramic stop-motion composite.
 
         Args:
             use_ai: Use AI segmentation for cleaner subject extraction.
             ai_model: AI model name (see AISegmenter for options).
+            spacing: Scale factor for subject spacing (1.0 = original,
+                >1 spreads subjects apart, <1 brings them closer).
+                Positions are scaled relative to the centroid of all
+                keyframe positions.
         """
-        warped_frames = []
-        masks = []
-
+        # --- Segment all keyframes (cache results) ---
+        seg_results = []
         for li in keyframe_list_indices:
             warped, mask = self.segment_keyframe(
                 li, threshold, morph_size,
@@ -1273,10 +1277,168 @@ class PanoramicPipeline:
                 use_ai=use_ai,
                 ai_model=ai_model,
             )
-            warped_frames.append(warped)
-            masks.append(mask)
+            seg_results.append((warped, mask))
+
+        # Cache segmentation results for fast re-composite
+        self._cached_seg = {
+            "indices": list(keyframe_list_indices),
+            "results": seg_results,
+            "params": (threshold, morph_size, dilate_iterations,
+                       erode_iterations, feather_radius, use_ai, ai_model),
+        }
+
+        return self._composite_with_spacing(
+            seg_results, opacity=opacity, shadow=shadow, spacing=spacing,
+        )
+
+    def recomposite(self, keyframe_list_indices: list[int],
+                    opacity: float = 1.0, shadow: bool = True,
+                    spacing: float = 1.0,
+                    threshold: int = 35, morph_size: int = 7,
+                    dilate_iterations: int = 0,
+                    erode_iterations: int = 0,
+                    feather_radius: int = 3,
+                    use_ai: bool = False,
+                    ai_model: str = "u2netp") -> np.ndarray:
+        """Fast re-composite using cached segmentation results.
+
+        If the requested keyframes are a subset of cached ones, reuses
+        cached warped frames and masks without re-segmenting.  If the
+        keyframe set or segmentation params changed, falls back to
+        full generate().
+
+        This enables interactive keyframe selection and spacing adjustment
+        with ~0.1-0.5s response time instead of 5-30s.
+        """
+        cache = getattr(self, "_cached_seg", None)
+        if cache is None:
+            return self.generate(
+                keyframe_list_indices,
+                threshold=threshold, morph_size=morph_size,
+                dilate_iterations=dilate_iterations,
+                erode_iterations=erode_iterations,
+                feather_radius=feather_radius,
+                opacity=opacity, shadow=shadow,
+                use_ai=use_ai, ai_model=ai_model,
+                spacing=spacing,
+            )
+
+        # Check if we can reuse the cache
+        cached_params = cache["params"]
+        current_params = (threshold, morph_size, dilate_iterations,
+                          erode_iterations, feather_radius, use_ai, ai_model)
+        cached_indices = cache["indices"]
+
+        if cached_params == current_params:
+            # Build index map: cached_indices[i] -> seg_results[i]
+            idx_map = {idx: i for i, idx in enumerate(cached_indices)}
+            # Check if all requested indices are in cache
+            if all(li in idx_map for li in keyframe_list_indices):
+                seg_results = [cache["results"][idx_map[li]]
+                               for li in keyframe_list_indices]
+                return self._composite_with_spacing(
+                    seg_results, opacity=opacity, shadow=shadow,
+                    spacing=spacing,
+                )
+
+        # Cache miss — full regeneration
+        return self.generate(
+            keyframe_list_indices,
+            threshold=threshold, morph_size=morph_size,
+            dilate_iterations=dilate_iterations,
+            erode_iterations=erode_iterations,
+            feather_radius=feather_radius,
+            opacity=opacity, shadow=shadow,
+            use_ai=use_ai, ai_model=ai_model,
+            spacing=spacing,
+        )
+
+    def _composite_with_spacing(self, seg_results: list[tuple],
+                                opacity: float = 1.0, shadow: bool = True,
+                                spacing: float = 1.0) -> np.ndarray:
+        """Composite segmented keyframes with optional spacing adjustment.
+
+        When spacing != 1.0, each subject is shifted so that the distance
+        between subjects (relative to their collective centroid) is scaled
+        by the spacing factor.  The canvas is expanded if needed.
+        """
+        if not seg_results:
+            return self.panorama.copy()
+
+        warped_frames = [r[0] for r in seg_results]
+        masks = [r[1] for r in seg_results]
+
+        if abs(spacing - 1.0) < 0.01:
+            # No spacing adjustment — use panorama as-is
+            return composite_stop_motion(
+                self.panorama, warped_frames, masks,
+                opacity=opacity, shadow=shadow,
+            )
+
+        # --- Compute subject centroids on the canvas ---
+        centroids = []
+        for mask in masks:
+            moments = cv2.moments(mask)
+            if moments["m00"] > 0:
+                cx = moments["m10"] / moments["m00"]
+                cy = moments["m01"] / moments["m00"]
+                centroids.append((cx, cy))
+            else:
+                centroids.append(None)
+
+        # Global centroid (center of all subjects)
+        valid_centroids = [c for c in centroids if c is not None]
+        if len(valid_centroids) < 2:
+            # Can't space out fewer than 2 subjects
+            return composite_stop_motion(
+                self.panorama, warped_frames, masks,
+                opacity=opacity, shadow=shadow,
+            )
+
+        global_cx = np.mean([c[0] for c in valid_centroids])
+        global_cy = np.mean([c[1] for c in valid_centroids])
+
+        # --- Compute per-subject translation offsets ---
+        shifts = []
+        for cent in centroids:
+            if cent is None:
+                shifts.append((0, 0))
+            else:
+                dx = (cent[0] - global_cx) * (spacing - 1.0)
+                dy = (cent[1] - global_cy) * (spacing - 1.0)
+                shifts.append((dx, dy))
+
+        # --- Compute new canvas bounds ---
+        # Figure out how much extra space we need
+        all_dx = [s[0] for s in shifts]
+        all_dy = [s[1] for s in shifts]
+        pad_left = max(0, int(np.ceil(-min(all_dx))))
+        pad_right = max(0, int(np.ceil(max(all_dx))))
+        pad_top = max(0, int(np.ceil(-min(all_dy))))
+        pad_bottom = max(0, int(np.ceil(max(all_dy))))
+
+        new_w = self.canvas_w + pad_left + pad_right
+        new_h = self.canvas_h + pad_top + pad_bottom
+
+        # Expand panorama onto new canvas
+        expanded_pano = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+        expanded_pano[pad_top:pad_top + self.canvas_h,
+                      pad_left:pad_left + self.canvas_w] = self.panorama
+
+        # --- Shift each subject and composite ---
+        shifted_frames = []
+        shifted_masks = []
+        for i, (frame, mask) in enumerate(zip(warped_frames, masks)):
+            dx, dy = shifts[i]
+            tx = pad_left + dx
+            ty = pad_top + dy
+            M = np.float32([[1, 0, tx], [0, 1, ty]])
+            shifted_f = cv2.warpAffine(frame, M, (new_w, new_h))
+            shifted_m = cv2.warpAffine(mask, M, (new_w, new_h))
+            shifted_frames.append(shifted_f)
+            shifted_masks.append(shifted_m)
 
         return composite_stop_motion(
-            self.panorama, warped_frames, masks,
+            expanded_pano, shifted_frames, shifted_masks,
             opacity=opacity, shadow=shadow,
         )

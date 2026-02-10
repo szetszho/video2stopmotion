@@ -48,6 +48,8 @@ except Exception:
 _processor: VideoProcessor | None = None
 _all_section_frames: list[tuple[int, np.ndarray]] = []
 _panoramic_pipeline: PanoramicPipeline | None = None
+_last_kf_indices: list[int] = []  # keyframe list-indices from last generate
+_last_seg_params: dict = {}       # segmentation params used for the cache
 
 
 def _bgr_to_rgb(img: np.ndarray) -> np.ndarray:
@@ -120,15 +122,18 @@ def generate(num_keyframes, seg_threshold, morph_size,
              dilate_iter, erode_iter, feather_radius,
              min_object_pct, opacity, enable_shadow,
              backdrop_density, alignment_method,
-             seg_method, ai_model):
-    """Build panorama + segment + composite in one step."""
-    global _panoramic_pipeline
+             seg_method, ai_model, spacing):
+    """Build panorama + segment + composite in one step.
+
+    Returns: (result_image, panorama_preview, info_text,
+              keyframe_gallery, keyframe_indices_text)
+    """
+    global _panoramic_pipeline, _last_kf_indices, _last_seg_params
 
     if _processor is None or not _all_section_frames:
-        return None, None, "Upload a video and select a section first."
+        return None, None, "Upload a video and select a section first.", None, ""
 
     frames_bgr = [f for _, f in _all_section_frames]
-    min_area = float(min_object_pct) / 100.0
     use_ai = (seg_method == "AI Model") and _AI_AVAILABLE
     n_kf = int(num_keyframes)
 
@@ -160,6 +165,14 @@ def generate(num_keyframes, seg_threshold, morph_size,
         else:
             kf_indices = [int(i * (total - 1) / (n_kf - 1)) for i in range(n_kf)]
 
+    _last_kf_indices = kf_indices
+    _last_seg_params = {
+        "threshold": int(seg_threshold), "morph_size": int(morph_size),
+        "dilate_iter": int(dilate_iter), "erode_iter": int(erode_iter),
+        "feather_radius": int(feather_radius),
+        "use_ai": use_ai, "ai_model": ai_model if use_ai else "u2netp",
+    }
+
     # --- Generate composite ---
     result_bgr = pipe.generate(
         kf_indices,
@@ -172,6 +185,7 @@ def generate(num_keyframes, seg_threshold, morph_size,
         shadow=enable_shadow,
         use_ai=use_ai,
         ai_model=ai_model if use_ai else "u2netp",
+        spacing=float(spacing),
     )
 
     seg_label = f"AI ({ai_model})" if use_ai else "Background subtraction"
@@ -181,7 +195,69 @@ def generate(num_keyframes, seg_threshold, morph_size,
         f"**{pipe.canvas_w}x{pipe.canvas_h}** canvas | "
         f"Segmentation: {seg_label}"
     )
-    return result_rgb, pano_preview, info
+
+    # --- Build keyframe gallery for interactive selection ---
+    kf_gallery = _build_keyframe_gallery(kf_indices)
+    kf_text = ",".join(str(i) for i in kf_indices)
+
+    return result_rgb, pano_preview, info, kf_gallery, kf_text
+
+
+def _build_keyframe_gallery(kf_indices: list[int]) -> list:
+    """Build a gallery of keyframe thumbnails with labels."""
+    gallery = []
+    for pos, li in enumerate(kf_indices):
+        if li < len(_all_section_frames):
+            fid, frame = _all_section_frames[li]
+            t = fid / _processor.fps if _processor else 0
+            label = f"#{pos+1} (f{li}, {t:.2f}s)"
+            gallery.append((_bgr_to_rgb(frame), label))
+    return gallery
+
+
+def update_preview(selected_indices_text, spacing, opacity, enable_shadow):
+    """Fast re-composite with changed keyframes or spacing.
+
+    Uses cached segmentation results — typically <0.5s response time.
+    """
+    if _panoramic_pipeline is None:
+        return None, "Generate a composite first."
+
+    # Parse the keyframe indices
+    try:
+        kf_indices = [int(x.strip()) for x in selected_indices_text.split(",")
+                      if x.strip()]
+    except ValueError:
+        return None, "Invalid keyframe indices. Use comma-separated numbers."
+
+    if not kf_indices:
+        return None, "No keyframes selected."
+
+    # Validate indices
+    total = len(_all_section_frames)
+    kf_indices = [i for i in kf_indices if 0 <= i < total]
+    if not kf_indices:
+        return None, "All indices out of range."
+
+    p = _last_seg_params
+    result_bgr = _panoramic_pipeline.recomposite(
+        kf_indices,
+        opacity=opacity,
+        shadow=enable_shadow,
+        spacing=float(spacing),
+        threshold=p.get("threshold", 35),
+        morph_size=p.get("morph_size", 7),
+        dilate_iterations=p.get("dilate_iter", 0),
+        erode_iterations=p.get("erode_iter", 0),
+        feather_radius=p.get("feather_radius", 3),
+        use_ai=p.get("use_ai", False),
+        ai_model=p.get("ai_model", "u2netp"),
+    )
+
+    result_rgb = _bgr_to_rgb(result_bgr)
+    info = f"**{len(kf_indices)} subjects** | Spacing: {spacing:.1f}x"
+
+    return result_rgb, info
 
 
 def save_image(image):
@@ -276,9 +352,28 @@ with gr.Blocks(title="Stop-Motion Composite", css=CSS,
                 3, 15, value=7, step=1, label="Number of Poses",
                 info="How many subject snapshots in the final image.",
             )
+            spacing = gr.Slider(
+                0.5, 3.0, value=1.0, step=0.1, label="Spacing",
+                info="Spread subjects apart (>1) or compress (<1). Great for tight turns.",
+            )
             generate_btn = gr.Button("Generate Composite",
                                       variant="primary", size="lg")
             composite_info = gr.Markdown("", elem_classes=["info-bar"])
+
+            # Step 4: Refine (interactive, fast)
+            gr.Markdown("### 4. Refine", elem_classes=["step-hdr"])
+            gr.Markdown(
+                "Edit which keyframes to include. "
+                "Remove a number to drop that pose, or reorder.",
+                elem_classes=["info-bar"],
+            )
+            selected_keyframes = gr.Textbox(
+                label="Keyframe Indices",
+                info="Comma-separated list of frame indices. Edit to add/remove poses.",
+                placeholder="Will be populated after Generate...",
+            )
+            update_btn = gr.Button("Update Preview",
+                                    variant="secondary", size="sm")
 
             # Advanced (collapsed)
             with gr.Accordion("Advanced Settings", open=False):
@@ -332,6 +427,10 @@ with gr.Blocks(title="Stop-Motion Composite", css=CSS,
                                          columns=6, height=160)
             panorama_preview = gr.Image(label="Panoramic Background",
                                         interactive=False, height=200)
+            keyframe_gallery = gr.Gallery(
+                label="Selected Keyframes (edit indices on the left to change)",
+                columns=7, height=140,
+            )
             composite_output = gr.Image(label="Result",
                                         interactive=False)
             with gr.Row():
@@ -363,9 +462,16 @@ with gr.Blocks(title="Stop-Motion Composite", css=CSS,
             dilate_iter, erode_iter, feather_radius,
             min_object_pct, opacity, enable_shadow,
             backdrop_density, alignment_method,
-            seg_method, ai_model,
+            seg_method, ai_model, spacing,
         ],
-        outputs=[composite_output, panorama_preview, composite_info],
+        outputs=[composite_output, panorama_preview, composite_info,
+                 keyframe_gallery, selected_keyframes],
+    )
+
+    update_btn.click(
+        fn=update_preview,
+        inputs=[selected_keyframes, spacing, opacity, enable_shadow],
+        outputs=[composite_output, composite_info],
     )
 
     save_btn.click(fn=save_image, inputs=[composite_output],
